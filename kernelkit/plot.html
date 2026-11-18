@@ -1,0 +1,1401 @@
+<!doctype html>
+<!--
+  kernelkit tuned-table viewer.  python -m kernelkit plot TABLE.csv  serves it; or open this file and a CSV.
+
+  The rows with the same key values (the columns before the ~<dim> bucket column) form a group; per group:
+  the bucket on x, us on y, one line per config, and a strip with the fastest config of every bucket range.
+
+  Query (or #hash) parameters:
+    csv=<url>              a table to fetch (repeatable: tabs); a GitHub blob link is read from raw.githubusercontent.com
+    data=<csv text>        the table itself; data=z:<base64url of deflate-raw>: compressed (what "Copy link" writes)
+    name=<file name>       the name of a data= table
+    live=1                 re-read the csv= table every 2 s
+    group=k=v,...  y=rel  xscale=lin  yscale=log|lin  clip=1.25  show=win|top3  sel=<config>@<point>  src=<i>
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kernelkit · tuned tables</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237aa2ff'/%3E%3Cstop offset='1' stop-color='%23c58cff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='24' height='24' rx='6.5' fill='url(%23g)'/%3E%3Cpath d='M5 16.5l4-5 4 2.5 6-7' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<script>
+  try {
+    document.documentElement.dataset.theme = localStorage.getItem("kk-theme")
+      || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+  } catch (e) { /* no storage: the default theme */ }
+</script>
+<!-- integrity: the whole file's hash, curl -sSL <url> | openssl dgst -sha384 -binary | openssl base64 -A -->
+<script src="https://cdn.plot.ly/plotly-3.7.0.min.js"
+        integrity="sha384-l4G4qURPwALv583BKlynU/4LiUx0rk9jcTX58Aq+Jc+jgWb52zeH2geZkSS3UPPs"
+        crossorigin="anonymous"></script>
+<style>
+:root {
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans",
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", "Cascadia Code", Menlo, Consolas,
+          "Liberation Mono", monospace;
+  --radius: 14px;
+}
+:root, [data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0a0d13; --panel: #11161f; --panel2: #161c27; --plot: #0e131b;
+  --border: #222a38; --border2: #2f394b; --text: #e5e9f0; --muted: #8791a6;
+  --accent: #7aa2ff; --accent2: #c58cff; --good: #3ddc97; --warn: #ffc857; --bad: #ff7a85; --gold: #ffd166;
+  --grid: rgba(148, 163, 184, 0.10); --track: #1c2330; --chip: #1b2230;
+  --hover: rgba(122, 162, 255, 0.08); --sel: rgba(122, 162, 255, 0.15);
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 14px 34px -18px rgba(0, 0, 0, 0.7);
+  --glow: radial-gradient(1100px 520px at 0% -8%, rgba(122, 162, 255, 0.13), transparent 62%),
+          radial-gradient(900px 480px at 100% -10%, rgba(197, 140, 255, 0.10), transparent 60%);
+}
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f5fa; --panel: #ffffff; --panel2: #f6f8fc; --plot: #ffffff;
+  --border: #e2e7f0; --border2: #cdd5e4; --text: #18202e; --muted: #667089;
+  --accent: #3f63e0; --accent2: #9b4de0; --good: #0f9f6e; --warn: #b7791f; --bad: #d6404e; --gold: #c98a00;
+  --grid: rgba(15, 23, 42, 0.07); --track: #edf1f7; --chip: #eef2f8;
+  --hover: rgba(63, 99, 224, 0.06); --sel: rgba(63, 99, 224, 0.11);
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 10px 26px -14px rgba(16, 24, 40, 0.20);
+  --glow: radial-gradient(1100px 520px at 0% -8%, rgba(63, 99, 224, 0.08), transparent 62%),
+          radial-gradient(900px 480px at 100% -10%, rgba(155, 77, 224, 0.06), transparent 60%);
+}
+* { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--border2) transparent; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { min-height: 100vh; background: var(--glow), var(--bg); background-attachment: fixed; color: var(--text);
+       font: 13px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
+code, kbd { font-family: var(--mono); }
+kbd { font-size: 10.5px; padding: 0 5px; margin: 0 1px; border-radius: 4px; border: 1px solid var(--border2);
+      background: var(--panel2); color: var(--text); }
+.muted { color: var(--muted); }
+.good { color: var(--good) !important; }
+.ok { color: color-mix(in srgb, var(--good) 55%, var(--text)) !important; }
+.warn { color: var(--warn) !important; }
+.bad { color: var(--bad) !important; }
+.grow { flex: 1; }
+
+/* ---- top bar ---- */
+.topbar { position: sticky; top: 0; z-index: 20; height: 56px; display: flex; align-items: center; gap: 14px;
+          padding: 0 18px; border-bottom: 1px solid var(--border);
+          background: color-mix(in srgb, var(--bg) 78%, transparent); backdrop-filter: saturate(1.4) blur(12px); }
+.topbar::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px; opacity: 0.55;
+                 background: linear-gradient(90deg, transparent, var(--accent) 30%, var(--accent2) 70%, transparent); }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; font-size: 14px; white-space: nowrap; }
+.brand svg { width: 26px; height: 26px; flex: none; filter: drop-shadow(0 4px 10px rgba(122, 162, 255, 0.35)); }
+.brand .sub { color: var(--muted); font-weight: 500; }
+.sources { flex: 1; min-width: 0; display: flex; gap: 6px; overflow-x: auto; padding: 4px 0; }
+.src { display: flex; align-items: baseline; gap: 8px; padding: 5px 11px; border-radius: 9px; cursor: pointer;
+       border: 1px solid transparent; background: transparent; color: var(--muted); white-space: nowrap;
+       font: 550 12.5px var(--mono); }
+.src:hover { color: var(--text); background: var(--hover); }
+.src.on { color: var(--text); background: var(--panel2); border-color: var(--border2); }
+.src .meta { font: 11px var(--sans); color: var(--muted); }
+.actions { display: flex; align-items: center; gap: 8px; }
+.btn { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border-radius: 9px;
+       border: 1px solid var(--border2); background: var(--panel2); color: var(--text); cursor: pointer;
+       font: 550 12.5px var(--sans); white-space: nowrap; transition: border-color .15s, background .15s; }
+.btn:hover { border-color: var(--accent); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { border: 0; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent2));
+               box-shadow: 0 8px 20px -10px var(--accent); }
+.btn.sm { height: 26px; padding: 0 9px; font-size: 12px; border-radius: 8px; }
+.btn.icon { width: 30px; padding: 0; justify-content: center; font-size: 15px; }
+.btn.live .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.btn.live.on { color: var(--good); border-color: color-mix(in srgb, var(--good) 55%, var(--border2)); }
+.btn.live.on .dot { background: var(--good); animation: pulse 1.8s infinite; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 65%, transparent); }
+                   70%, 100% { box-shadow: 0 0 0 7px transparent; } }
+.urlbar { position: sticky; top: 56px; z-index: 19; display: flex; gap: 8px; padding: 10px 18px;
+          background: var(--panel); border-bottom: 1px solid var(--border); }
+input.text { height: 30px; padding: 0 10px; border-radius: 9px; border: 1px solid var(--border2); outline: none;
+             background: var(--panel2); color: var(--text); font: 12.5px var(--mono); min-width: 0; }
+input.text:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+.urlbar input { flex: 1; }
+
+/* ---- layout ---- */
+#app { display: grid; grid-template-columns: 250px minmax(0, 1fr) 300px; grid-template-areas: "groups center legend";
+       gap: 14px; padding: 14px 18px 30px; align-items: start; }
+.groups { grid-area: groups; }
+.center { grid-area: center; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.legend { grid-area: legend; }
+.panel { position: sticky; top: 70px; max-height: calc(100vh - 84px); overflow: auto; padding: 12px;
+         background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+@media (max-width: 1320px) {
+  #app { grid-template-columns: 250px minmax(0, 1fr); grid-template-areas: "groups center" "legend center"; }
+  .panel { position: static; max-height: none; }
+  .lg-list { max-height: 62vh; overflow: auto; }
+}
+@media (max-width: 880px) {
+  #app { grid-template-columns: minmax(0, 1fr); grid-template-areas: "groups" "center" "legend"; }
+}
+.panel-head { display: flex; align-items: center; justify-content: space-between; margin: 2px 2px 10px;
+              font: 650 11px var(--sans); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.count { font: 500 11px var(--mono); color: var(--muted); text-transform: none; letter-spacing: 0; }
+.search { width: 100%; margin-bottom: 8px; }
+.chip { display: inline-flex; align-items: baseline; gap: 4px; padding: 2px 7px; border-radius: 999px;
+        background: var(--chip); font: 11px var(--mono); white-space: nowrap; }
+.chip .ck { color: var(--muted); }
+.chip b { font-weight: 650; }
+.common { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 10px; padding-bottom: 10px; border-bottom: 1px dashed var(--border); }
+
+/* ---- groups ---- */
+.gcard { margin-bottom: 7px; padding: 9px 10px 10px; border-radius: 11px; cursor: pointer;
+         background: var(--panel2); border: 1px solid var(--border); transition: border-color .15s, box-shadow .15s, transform .1s; }
+.gcard:hover { border-color: var(--border2); transform: translateY(-1px); }
+.gcard.on { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+.gcard .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.gmeta { margin-top: 6px; font-size: 11px; color: var(--muted); }
+.mini { display: flex; gap: 1px; height: 6px; margin-top: 7px; border-radius: 3px; overflow: hidden; background: var(--track); }
+.mini i { flex: 1; min-width: 1px; }
+
+/* ---- chart card ---- */
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.chart-card { padding: 14px 16px 10px; }
+.chart-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 18px; }
+.title { font: 650 16px var(--sans); }
+.title .tk { color: var(--muted); font: 500 14px var(--mono); }
+.title .tv { font: 650 15px var(--mono); }
+.title .sep { color: var(--border2); margin: 0 6px; }
+.subtitle { margin-top: 3px; font-size: 12px; color: var(--muted); }
+.subtitle .notice { color: var(--warn); }
+.subtitle a { color: var(--accent); cursor: pointer; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.seg { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: 9px;
+       background: var(--panel2); border: 1px solid var(--border); }
+.seg button { border: 0; background: transparent; color: var(--muted); padding: 3px 10px; border-radius: 6px;
+              font: 600 12px var(--sans); cursor: pointer; }
+.seg button:hover:not(:disabled) { color: var(--text); }
+.seg button.on { color: #fff; background: var(--accent); box-shadow: 0 4px 12px -6px var(--accent); }
+.seg button:disabled { opacity: .35; cursor: default; }
+.seg .lbl { padding: 0 4px 0 7px; font: 650 10.5px var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.seg select { height: 22px; border: 0; border-radius: 6px; background: transparent; color: var(--text);
+              font: 600 12px var(--mono); cursor: pointer; outline: none; }
+.seg select option { background: var(--panel); }
+.presets { display: flex; margin-bottom: 8px; }
+.presets button { flex: 1; }
+.chart-wrap { position: relative; margin-top: 8px; }
+#chart { height: clamp(430px, 64vh, 780px); }
+.chart-error { height: 100%; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted);
+               border: 1px dashed var(--border2); border-radius: 12px; }
+.chart-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 14px; margin-top: 2px;
+              font-size: 11.5px; color: var(--muted); }
+
+/* ---- inspector (the clicked point) ---- */
+.inspector { position: absolute; top: 34px; right: 22px; z-index: 6; width: min(356px, calc(100% - 96px));
+             max-height: calc(100% - 82px); overflow: auto; padding: 12px 12px 10px; border-radius: 13px;
+             border: 1px solid var(--border2); background: color-mix(in srgb, var(--panel) 90%, transparent);
+             backdrop-filter: blur(10px); box-shadow: 0 18px 50px -16px rgba(0, 0, 0, 0.55); animation: pop .16s ease-out; }
+.inspector.left { right: auto; left: 76px; }
+@keyframes pop { from { opacity: 0; transform: translateY(-4px) scale(.98); } to { opacity: 1; transform: none; } }
+.in-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.in-name { font: 650 14px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.in-sub { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.icon-btn { width: 26px; height: 26px; border-radius: 8px; border: 1px solid transparent; background: transparent;
+            color: var(--muted); cursor: pointer; font-size: 13px; }
+.icon-btn:hover { color: var(--text); background: var(--hover); border-color: var(--border); }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(74px, 1fr)); gap: 6px; margin: 10px 0 2px; }
+.kpi { min-width: 0; padding: 6px 8px; border-radius: 9px; background: var(--panel2); border: 1px solid var(--border); }
+.kpi .k { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi .v { font: 650 15px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi .v small { font-size: 11px; font-weight: 500; color: var(--muted); }
+.in-sec { margin: 11px 2px 5px; font: 650 10.5px var(--sans); text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rank { position: relative; max-height: 200px; overflow: auto; padding: 3px; border-radius: 9px;
+        background: var(--panel2); border: 1px solid var(--border); }
+.rk { display: grid; grid-template-columns: 18px 22px minmax(0, 1fr) 50px 46px 52px; align-items: center; gap: 6px;
+      padding: 3px 6px; border-radius: 7px; cursor: pointer; font: 11.5px var(--mono); }
+.rk:hover { background: var(--hover); }
+.rk.sel { background: var(--sel); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+.rk.off { opacity: .45; }
+.rk .n { color: var(--muted); text-align: right; }
+.rk .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rk .us, .rk .d { text-align: right; white-space: nowrap; }
+.rk .d { font-size: 11px; }
+.rk-miss { padding: 4px 8px 3px; font: 11px var(--mono); color: var(--muted); }
+.bar { height: 6px; border-radius: 3px; background: var(--track); overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 3px; }
+.facts { display: grid; gap: 3px; font-size: 12px; }
+.fact { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; }
+.fact .fk { color: var(--muted); }
+.fact .fv { font: 11.5px var(--mono); overflow-wrap: anywhere; }
+details.in-row { margin-top: 9px; }
+details.in-row summary { cursor: pointer; font-size: 11.5px; color: var(--muted); }
+.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; margin-top: 6px; padding: 8px 10px;
+      border-radius: 9px; background: var(--panel2); border: 1px solid var(--border); font: 11.5px var(--mono); }
+.kv .k { color: var(--muted); }
+.kv .v { overflow-wrap: anywhere; }
+.in-actions { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+.hint { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* ---- dispatch map ---- */
+.dispatch { padding: 14px 16px 8px; }
+.card-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 14px; margin-bottom: 6px; }
+.card-title { font: 650 13.5px var(--sans); }
+.card-note { font-size: 11.5px; color: var(--muted); }
+table.dt { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.dt th { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border);
+              font: 650 10.5px var(--sans); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+table.dt td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+table.dt tbody tr:last-child td { border-bottom: 0; }
+table.dt tbody tr { cursor: pointer; transition: background .12s; }
+table.dt tbody tr:hover { background: var(--hover); }
+table.dt tbody tr.cur { background: var(--sel); }
+table.dt .num { text-align: right; font-family: var(--mono); white-space: nowrap; }
+table.dt th.num { text-align: right; }
+table.dt .mono { font-family: var(--mono); white-space: nowrap; }
+.cfgcell { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); }
+
+/* ---- legend ---- */
+.lg-solver { display: flex; align-items: center; gap: 8px; margin: 12px 4px 4px; cursor: pointer; user-select: none;
+             font: 650 11.5px var(--mono); color: var(--muted); }
+.lg-solver:first-child { margin-top: 2px; }
+.lg-solver:hover { color: var(--text); }
+.lg-solver .rule { flex: 1; height: 1px; background: var(--border); }
+.lg-item { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 4px 6px;
+           border-radius: 8px; cursor: pointer; user-select: none; transition: background .12s, opacity .12s; }
+.lg-item:hover { background: var(--hover); }
+.lg-item.off { opacity: .38; }
+.lg-item.off .sw { filter: grayscale(1); }
+.lg-item.sel { background: var(--sel); }
+.lg-name { font: 12px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lg-name .pre { color: var(--muted); }
+.lg-stat { display: flex; gap: 7px; font: 11px var(--mono); color: var(--muted); white-space: nowrap; }
+.lg-stat .star { color: var(--gold); }
+.lg-hint { margin-top: 10px; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.sw { flex: none; display: block; }
+.sw polygon, .sw circle { stroke: var(--panel); stroke-width: 1; }
+
+/* ---- empty state, drop veil, toast ---- */
+.empty { min-height: calc(100vh - 56px); display: grid; place-items: center; padding: 30px; }
+.empty-card { position: relative; max-width: 660px; padding: 30px 40px 26px; border-radius: 22px; text-align: center;
+              background: var(--panel); border: 1px solid var(--border); box-shadow: var(--shadow); }
+.empty-card::before { content: ""; position: absolute; inset: -1px; padding: 1px; border-radius: inherit; pointer-events: none; opacity: .75;
+                      background: linear-gradient(135deg, var(--accent), transparent 38%, transparent 62%, var(--accent2));
+                      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+                      -webkit-mask-composite: xor; mask-composite: exclude; }
+.empty .art { width: 100%; height: 120px; display: block; }
+.empty h1 { margin: 14px 0 8px; font-size: 22px; letter-spacing: -.01em; }
+.empty p { margin: 0 0 18px; color: var(--muted); line-height: 1.6; }
+.empty p.small { margin: 0; font-size: 12px; }
+.empty code { padding: 1px 6px; border-radius: 6px; background: var(--chip); color: var(--text); font-size: 12px; }
+.empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 18px; }
+.veil { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; backdrop-filter: blur(4px);
+        background: color-mix(in srgb, var(--bg) 70%, transparent); }
+.veil > div { padding: 34px 48px; border-radius: 20px; border: 2px dashed var(--accent); background: var(--panel);
+              font: 600 16px var(--sans); }
+.toast { position: fixed; left: 50%; bottom: 22px; z-index: 60; transform: translateX(-50%); max-width: min(92vw, 780px);
+         padding: 9px 16px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border2);
+         box-shadow: var(--shadow); font-size: 12.5px; animation: rise .18s ease-out; }
+.toast.err { border-radius: 12px; border-color: var(--bad); color: var(--bad); }
+@keyframes rise { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <defs><linearGradient id="kkg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#7aa2ff"/><stop offset="1" stop-color="#c58cff"/></linearGradient></defs>
+      <rect width="24" height="24" rx="6.5" fill="url(#kkg)"/>
+      <path d="M5 16.5l4-5 4 2.5 6-7" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span>kernelkit</span><span class="sub">tuned tables</span>
+  </div>
+  <nav id="sources" class="sources"></nav>
+  <div class="actions">
+    <button id="btn-live" class="btn live" hidden title="Re-read the table every 2 s (e.g. while it is being tuned)"><span class="dot"></span>Live</button>
+    <button id="btn-open" class="btn" title="Open local CSV files (or drop them anywhere on the page)">Open…</button>
+    <button id="btn-url" class="btn" title="Load a CSV from a URL">URL…</button>
+    <button id="btn-link" class="btn" title="Copy a link to this view">Copy link</button>
+    <button id="btn-theme" class="btn icon" title="Light / dark">◐</button>
+    <input id="file" type="file" accept=".csv,text/csv,text/plain" multiple hidden>
+  </div>
+</header>
+<form id="urlbar" class="urlbar" hidden>
+  <input id="url-input" class="text" type="text" spellcheck="false" autocomplete="off"
+         placeholder="https://…/a8w4_moe_tuned.csv  (a GitHub blob link works too)">
+  <button class="btn primary" type="submit">Load</button>
+  <button class="btn" type="button" id="url-cancel">Cancel</button>
+</form>
+
+<main id="app" hidden>
+  <aside class="panel groups">
+    <div class="panel-head"><span>Groups</span><span id="group-count" class="count"></span></div>
+    <div id="common" class="common"></div>
+    <input id="group-filter" class="text search" type="text" placeholder="filter groups" spellcheck="false" hidden>
+    <div id="group-list"></div>
+  </aside>
+
+  <section class="center">
+    <div class="card chart-card">
+      <div class="chart-head">
+        <div><div id="title" class="title"></div><div id="subtitle" class="subtitle"></div></div>
+        <div class="controls">
+          <div class="seg" id="seg-y" title="y: the time, or the time over the fastest shown config at the same point">
+            <button data-v="us">us</button><button data-v="rel">× fastest</button></div>
+          <div class="seg" id="seg-xs"><span class="lbl">x</span><button data-v="log">log</button><button data-v="lin">lin</button></div>
+          <div class="seg" id="seg-ys"><span class="lbl">y</span><button data-v="log">log</button><button data-v="lin">lin</button></div>
+          <label class="seg" id="cap-wrap" title="clip the y axis at this multiple of the fastest"><span class="lbl">clip</span>
+            <select id="cap">
+              <option value="1.05">×1.05</option><option value="1.1">×1.1</option><option value="1.25">×1.25</option>
+              <option value="1.5">×1.5</option><option value="2">×2</option><option value="4">×4</option><option value="inf">all</option>
+            </select></label>
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <div id="chart"></div>
+        <div id="inspector" class="inspector" hidden></div>
+      </div>
+      <div class="chart-foot">
+        <span>click a point or the strip for details · drag to zoom · double-click to reset</span>
+        <span><kbd>↑</kbd><kbd>↓</kbd> group &nbsp;<kbd>←</kbd><kbd>→</kbd> point &nbsp;<kbd>Esc</kbd> close</span>
+      </div>
+    </div>
+    <div class="card dispatch">
+      <div class="card-head"><div class="card-title">Dispatch map</div><div id="dispatch-note" class="card-note"></div></div>
+      <table class="dt">
+        <thead><tr><th id="dt-range">range</th><th>fastest</th><th class="num">us</th>
+          <th class="num" title="how much slower the runner-up is (the closest call in the range)">lead</th><th class="num">points</th></tr></thead>
+        <tbody id="dispatch"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <aside class="panel legend">
+    <div class="panel-head"><span>Configs</span><span id="cfg-count" class="count"></span></div>
+    <input id="cfg-filter" class="text search" type="text" placeholder="filter, e.g. mega p16" spellcheck="false">
+    <div class="seg presets" id="presets" title="which configs to show">
+      <button data-v="all">All</button><button data-v="win">Winners</button><button data-v="top3">Top 3</button></div>
+    <div id="legend" class="lg-list"></div>
+    <div class="lg-hint">click: show / hide · double-click: only this one · hover: highlight ·
+      <span class="star" style="color: var(--gold)">★</span> points where fastest · × geomean over the fastest</div>
+  </aside>
+</main>
+
+<section id="empty" class="empty" hidden>
+  <div class="empty-card">
+    <svg class="art" viewBox="0 0 400 120" preserveAspectRatio="none" aria-hidden="true">
+      <g fill="none" stroke-width="2.4" stroke-linecap="round">
+        <path d="M14 30 C 90 40, 150 64, 220 78 S 330 92, 386 96" stroke="#7aa2ff"/>
+        <path d="M14 62 C 80 62, 140 58, 200 52 S 300 44, 386 40" stroke="#c58cff"/>
+        <path d="M14 86 C 90 84, 150 70, 230 58 S 320 30, 386 18" stroke="#3ddc97" opacity=".9"/>
+      </g>
+      <g fill="#7aa2ff"><circle cx="14" cy="30" r="3.4"/><circle cx="120" cy="52" r="3.4"/></g>
+      <g fill="#c58cff"><circle cx="200" cy="52" r="3.4"/><circle cx="300" cy="44" r="3.4"/></g>
+      <g fill="#3ddc97"><circle cx="386" cy="18" r="3.4"/></g>
+      <rect x="14" y="108" width="128" height="8" rx="2" fill="#7aa2ff"/>
+      <rect x="144" y="108" width="130" height="8" rx="2" fill="#c58cff"/>
+      <rect x="276" y="108" width="110" height="8" rx="2" fill="#3ddc97"/>
+    </svg>
+    <h1>Which config is fastest where?</h1>
+    <p>Open a kernelkit tuned table. Rows with the same key values form a group; for each group the bucket goes on x,
+       <code>us</code> on y, one line per config, and a strip shows the fastest config in every bucket range.</p>
+    <div class="empty-actions">
+      <button class="btn primary" data-act="open">Open CSV…</button>
+      <button class="btn" data-act="url">Load from URL…</button>
+      <button class="btn" data-act="demo">Try a demo</button>
+    </div>
+    <p class="small">or drop a <code>*_tuned.csv</code> on the page · <code>?csv=&lt;url&gt;</code> · <code>python -m kernelkit plot TABLE.csv</code></p>
+  </div>
+</section>
+<div id="veil" class="veil" hidden><div>Drop the CSV to open it</div></div>
+<div id="toast" class="toast" hidden></div>
+
+<script>/*KK_EMBED*/</script>
+<script>
+"use strict";
+(() => {
+// ================================================================ helpers
+const $ = (sel, root = document) => root.querySelector(sel);
+const SVGNS = "http://www.w3.org/2000/svg";
+const MONO = 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
+const SANS = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif';
+
+// An element; the children are nodes or text (never parsed as HTML).
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k === "style") Object.assign(e.style, v);
+    else e.setAttribute(k, v === true ? "" : String(v));
+  }
+  for (const c of kids.flat(Infinity)) if (c != null && c !== false) e.append(c instanceof Node ? c : String(c));
+  return e;
+}
+function sv(tag, attrs) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, String(v));
+  return e;
+}
+const collator = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
+const natCmp = (a, b) => collator.compare(a, b);
+const escP = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");  // Plotly text
+const fmtUs = v => v == null || !Number.isFinite(v) ? "–" : Math.abs(v) < 1 ? v.toPrecision(2) : v.toFixed(1);
+const fmtRel = r => r == null || !Number.isFinite(r) ? "–" : "×" + (r < 10 ? r.toFixed(3) : r.toFixed(1));
+function fmtDelta(r) {  // r = us / fastest
+  if (r == null || !Number.isFinite(r)) return "–";
+  const d = (r - 1) * 100, a = Math.abs(d);
+  return (d < 0 ? "−" : "+") + a.toFixed(a < 10 ? 1 : 0) + "%";
+}
+const deltaClass = r => r == null ? "muted" : r < 1 ? "good" : r <= 1.01 ? "ok" : r <= 1.05 ? "warn" : "bad";
+const solverOf = c => c.split(/\s+/, 1)[0];
+const knobsOf = c => { const i = c.search(/\s/); return i < 0 ? "" : c.slice(i + 1).trim(); };
+const csvLine = row => row.map(s => /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s).join(",");
+function fmtTime(d) {
+  if (!d || isNaN(d)) return "";
+  const p = n => String(n).padStart(2, "0"), t = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return d.toDateString() === new Date().toDateString() ? t : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${t}`;
+}
+
+// RFC 4180: quoted fields, "" inside quotes, CRLF or LF.
+function parseCSV(text) {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const rows = [];
+  let row = [], f = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c !== '"') f += c;
+      else if (text[i + 1] === '"') { f += '"'; i++; }
+      else q = false;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(f); f = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(f); rows.push(row); row = []; f = "";
+    } else f += c;
+  }
+  if (f !== "" || row.length) { row.push(f); rows.push(row); }
+  return rows.filter(r => r.length > 1 || r[0].trim() !== "");
+}
+
+// ================================================================ colors
+function oklchHex(L, C, hue) {
+  const a = C * Math.cos(hue * Math.PI / 180), b = C * Math.sin(hue * Math.PI / 180);
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  return "#" + [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+                -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s].map(x => {
+    x = Math.min(1, Math.max(0, x));
+    x = x <= 0.0031308 ? 12.92 * x : 1.055 * x ** (1 / 2.4) - 0.055;
+    return Math.round(x * 255).toString(16).padStart(2, "0");
+  }).join("");
+}
+function textOn(hex) {  // black or white text on a fill
+  const n = parseInt(hex.slice(1), 16), lin = c => (c /= 255) <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  return 0.2126 * lin(n >> 16 & 255) + 0.7152 * lin(n >> 8 & 255) + 0.0722 * lin(n & 255) > 0.33 ? "#0b0f17" : "#ffffff";
+}
+const theme = () => document.documentElement.dataset.theme === "light" ? "light" : "dark";
+const colorCache = new Map();
+// A config keeps its color in every group of a table: golden-angle hues, three lightness steps.
+function colorOf(c) {
+  const key = theme() + "\u0000" + c;
+  let col = colorCache.get(key);
+  if (!col) {
+    const i = S.model ? S.model.cindex.get(c) ?? 0 : 0, light = theme() === "light";
+    col = oklchHex((light ? [0.56, 0.47, 0.64] : [0.76, 0.67, 0.85])[i % 3], light ? 0.17 : 0.15, (24 + i * 137.508) % 360);
+    colorCache.set(key, col);
+  }
+  return col;
+}
+const SYMBOLS = ["circle", "square", "diamond", "triangle-up", "hexagon", "star", "pentagon", "triangle-down", "cross", "x"];
+const symbolOf = c => SYMBOLS[(S.model.sindex.get(solverOf(c)) ?? 0) % SYMBOLS.length];  // one marker per solver
+function themeColors() {
+  const cs = getComputedStyle(document.documentElement), v = n => cs.getPropertyValue(n).trim();
+  return {text: v("--text"), muted: v("--muted"), border: v("--border"), border2: v("--border2"), grid: v("--grid"),
+          plot: v("--plot"), panel: v("--panel"), track: v("--track")};
+}
+// The legend sample of a config: its line and its marker.
+function swatch(c, w = 26) {
+  const col = colorOf(c), s = sv("svg", {class: "sw", width: w, height: 14, viewBox: `0 0 ${w} 14`, "aria-hidden": "true"});
+  s.append(sv("line", {x1: 1.5, y1: 7, x2: w - 1.5, y2: 7, stroke: col, "stroke-width": 2.2, "stroke-linecap": "round"}),
+           marker(symbolOf(c), w / 2, 7, 4, col));
+  return s;
+}
+function marker(sym, cx, cy, r, col) {
+  const ngon = (k, rr, rot) => Array.from({length: k}, (_, i) => {
+    const a = (rot + i * 360 / k) * Math.PI / 180;
+    return [rr * Math.cos(a), rr * Math.sin(a)];
+  });
+  const plus = (a, b) => [[-a, -b], [a, -b], [a, -a], [b, -a], [b, a], [a, a], [a, b], [-a, b], [-a, a], [-b, a], [-b, -a], [-a, -a]];
+  let pts;
+  switch (sym) {
+    case "square": pts = ngon(4, r * 1.2, 45); break;
+    case "diamond": pts = ngon(4, r * 1.3, -90); break;
+    case "triangle-up": pts = ngon(3, r * 1.3, -90); break;
+    case "triangle-down": pts = ngon(3, r * 1.3, 90); break;
+    case "pentagon": pts = ngon(5, r * 1.1, -90); break;
+    case "hexagon": pts = ngon(6, r * 1.1, -90); break;
+    case "star": pts = ngon(10, 1, -90).map(([x, y], i) => [x * r * (i % 2 ? 0.55 : 1.35), y * r * (i % 2 ? 0.55 : 1.35)]); break;
+    case "cross": pts = plus(r * 0.42, r * 1.15); break;
+    case "x": pts = plus(r * 0.42, r * 1.15).map(([x, y]) => [(x - y) * Math.SQRT1_2, (x + y) * Math.SQRT1_2]); break;
+    default: return sv("circle", {cx, cy, r, fill: col});
+  }
+  return sv("polygon", {points: pts.map(([x, y]) => `${(cx + x).toFixed(2)},${(cy + y).toFixed(2)}`).join(" "), fill: col});
+}
+
+// ================================================================ the table
+// A kernelkit table: key columns, one bucket column ~<dim>, config, us, then metrics. The key values
+// name a group; in a group every config has at most one us per bucket point (the fastest row if more).
+function buildModel(text, name) {
+  const rows = parseCSV(text);
+  if (!rows.length) throw new Error(`${name}: empty`);
+  const fields = rows[0].map(s => s.trim());
+  const ci = fields.indexOf("config"), ui = fields.indexOf("us");
+  if (ci < 0) throw new Error(`${name}: no "config" column, is it a kernelkit tuned table? (header: ${fields.join(",")})`);
+  if (ui < 0) throw new Error(`${name}: no "us" column`);
+  const bis = fields.map((f, i) => i).filter(i => i < ci && fields[i].startsWith("~"));
+  if (bis.length !== 1) throw new Error(`${name}: ${bis.length ? "more than one" : "no"} bucket column (~<dim>) before config`);
+  const bi = bis[0];
+  const keyIdx = fields.map((f, i) => i).filter(i => i < ci && i !== bi);
+  const gmap = new Map();
+  let used = 0, skipped = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r], cfg = (row[ci] || "").trim(), us = parseFloat(row[ui]);
+    if (!cfg || !Number.isFinite(us)) { skipped++; continue; }
+    const kv = keyIdx.map(i => (row[i] || "").trim()), id = JSON.stringify(kv);
+    if (!gmap.has(id)) gmap.set(id, {kv, raw: []});
+    gmap.get(id).raw.push({x: (row[bi] || "").trim(), cfg, us, row});
+    used++;
+  }
+  if (!used) throw new Error(`${name}: no row with a config and a numeric us`);
+  const keys = keyIdx.map(i => fields[i]);
+  const groups = [...gmap.values()].map((g, i) => makeGroup(g, i, keys));
+  const varying = keys.filter((k, i) => new Set(groups.map(g => g.kv[i])).size > 1);
+  for (const g of groups) g.label = varying.map(k => `${k}=${g.keys[k]}`).join(" · ") || "all rows";
+  const all = [...new Set(groups.flatMap(g => g.cfgs))]
+    .sort((a, b) => natCmp(solverOf(a), solverOf(b)) || natCmp(a, b));
+  const solvers = [...new Set(all.map(solverOf))];
+  return {
+    name, fields, keys, varying, common: keys.filter(k => !varying.includes(k)),
+    bucketCol: fields[bi], bucket: fields[bi].slice(1),
+    metricIdx: fields.map((f, i) => i).filter(i => i > ci && i !== ui),
+    groups, nrows: used, skipped,
+    cindex: new Map(all.map((c, i) => [c, i])), sindex: new Map(solvers.map((s, i) => [s, i])),
+  };
+}
+
+function makeGroup(raw, idx, keys) {
+  const xs = [...new Set(raw.raw.map(r => r.x))];
+  const numeric = xs.every(x => x !== "" && Number.isFinite(+x));
+  const points = numeric ? [...new Set(xs.map(Number))].sort((a, b) => a - b) : xs;
+  const at = new Map(points.map((p, j) => [String(p), j]));
+  const cfgs = [...new Set(raw.raw.map(r => r.cfg))], n = points.length;
+  const us = {}, rowOf = {}, rank = {};
+  for (const c of cfgs) { us[c] = Array(n).fill(null); rowOf[c] = Array(n).fill(null); rank[c] = Array(n).fill(null); }
+  for (const r of raw.raw) {
+    const j = at.get(numeric ? String(+r.x) : r.x);
+    if (us[r.cfg][j] == null || r.us < us[r.cfg][j]) { us[r.cfg][j] = r.us; rowOf[r.cfg][j] = r.row; }
+  }
+  const best = Array(n).fill(null), winner = Array(n).fill(null);
+  for (let j = 0; j < n; j++) {
+    const order = cfgs.filter(c => us[c][j] != null).sort((a, b) => us[a][j] - us[b][j]);
+    order.forEach((c, k) => { rank[c][j] = k + 1; });
+    if (order.length) { winner[j] = order[0]; best[j] = us[order[0]][j]; }
+  }
+  // over all configs (not only the shown ones): wins, the geomean of us / fastest, the best rank
+  const wins = {}, geo = {}, count = {}, minRank = {};
+  for (const c of cfgs) {
+    let w = 0, s = 0, k = 0, mr = Infinity;
+    for (let j = 0; j < n; j++) {
+      if (us[c][j] == null) continue;
+      k++; s += Math.log(us[c][j] / best[j]); mr = Math.min(mr, rank[c][j]); w += rank[c][j] === 1;
+    }
+    wins[c] = w; geo[c] = k ? Math.exp(s / k) : Infinity; count[c] = k; minRank[c] = mr;
+  }
+  // legend order: solvers by their best config, in a solver the most wins first, then the geomean
+  const sBest = new Map();
+  for (const c of cfgs) sBest.set(solverOf(c), Math.min(sBest.get(solverOf(c)) ?? Infinity, geo[c]));
+  const order = [...cfgs].sort((a, b) => {
+    const sa = solverOf(a), sb = solverOf(b);
+    if (sa !== sb) return sBest.get(sa) - sBest.get(sb) || natCmp(sa, sb);
+    return wins[b] - wins[a] || geo[a] - geo[b] || natCmp(a, b);
+  });
+  return {idx, kv: raw.kv, keys: Object.fromEntries(keys.map((k, i) => [k, raw.kv[i]])), points, numeric, cfgs,
+          us, rowOf, rank, best, winner, wins, geo, count, minRank, order};
+}
+
+// ================================================================ state
+const S = {
+  sources: [], si: 0, model: null, view: null, gi: 0,
+  y: "us", xlog: true, ylog: null, cap: 1.5,             // ylog null: automatic
+  preset: "all", hidden: new Set(), forced: new Set(), filter: "", gfilter: "",
+  sel: null, hover: null, inSide: "right", rowOpen: false, live: false, traceIdx: {},
+};
+const CAPS = [1.05, 1.1, 1.25, 1.5, 2, 4, Infinity];
+const curGroup = () => S.model.groups[S.gi];
+
+// Shown: passes the text filter, and either shown by hand or passes the preset and not hidden by hand.
+const presetPass = (g, c) => S.preset === "win" ? g.wins[c] > 0 : S.preset === "top3" ? g.minRank[c] <= 3 : true;
+function filterPass(c) {
+  const t = S.filter.trim().toLowerCase();
+  return !t || t.split(/\s+/).every(w => c.toLowerCase().includes(w));
+}
+const isShown = (g, c) => filterPass(c) && (S.forced.has(c) || (presetPass(g, c) && !S.hidden.has(c)));
+function setShown(g, c, on) {
+  if (on) { S.hidden.delete(c); if (!presetPass(g, c)) S.forced.add(c); }
+  else { S.hidden.add(c); S.forced.delete(c); }
+}
+function isolate(g, c) {
+  const shown = g.cfgs.filter(x => isShown(g, x));
+  if (shown.length === 1 && shown[0] === c) { S.hidden.clear(); S.forced.clear(); return; }  // again: all
+  for (const x of g.cfgs) setShown(g, x, x === c);
+}
+
+// What the chart compares: the fastest shown config per point, the runner-up, the ranks among the shown.
+function computeView(g) {
+  const n = g.points.length, shown = g.cfgs.filter(c => isShown(g, c));
+  const best = Array(n).fill(null), win = Array(n).fill(null), second = Array(n).fill(null), nShown = Array(n).fill(0);
+  const rank = {};
+  for (const c of g.cfgs) rank[c] = Array(n).fill(null);
+  for (let j = 0; j < n; j++) {
+    const order = shown.filter(c => g.us[c][j] != null).sort((a, b) => g.us[a][j] - g.us[b][j]);
+    order.forEach((c, k) => { rank[c][j] = k + 1; });
+    nShown[j] = order.length;
+    if (order.length) { win[j] = order[0]; best[j] = g.us[order[0]][j]; }
+    if (order.length > 1) second[j] = g.us[order[1]][j];
+  }
+  return {shown, shownSet: new Set(shown), best, win, second, rank, nShown};
+}
+// Runs of consecutive points with the same label: [{cfg, a, b}] (a..b inclusive).
+function runs(labels) {
+  const out = [];
+  labels.forEach((c, j) => {
+    const last = out[out.length - 1];
+    if (last && last.cfg === c) last.b = j; else out.push({cfg: c, a: j, b: j});
+  });
+  return out;
+}
+// The calls that points a..b serve: (the point before a, point b]; the last point serves every larger call.
+function rangeText(g, a, b) {
+  const P = g.points, n = P.length;
+  if (!g.numeric) return a === b ? String(P[a]) : `${P[a]} … ${P[b]}`;
+  if (a === 0 && b === n - 1) return "all";
+  if (a === 0) return `≤ ${P[b]}`;
+  if (b === n - 1) return `> ${P[a - 1]}`;
+  return `(${P[a - 1]}, ${P[b]}]`;
+}
+// Cell edges of the strip: cell j spans (P[j-1], P[j]], the first and the last get half a step outside.
+function edgesOf(P, log) {
+  const n = P.length;
+  if (n === 1) return log ? [P[0] / 2, P[0] * 2] : [P[0] - 0.5, P[0] + 0.5];
+  return log ? [P[0] / Math.sqrt(P[1] / P[0]), ...P.slice(0, -1), P[n - 1] * Math.sqrt(P[n - 1] / P[n - 2])]
+             : [P[0] - (P[1] - P[0]) / 2, ...P.slice(0, -1), P[n - 1] + (P[n - 1] - P[n - 2]) / 2];
+}
+// Log-axis ticks at tuned points that fit without overlapping, powers of 2 and 10 first.
+function pickTicks(P, W, lo, hi) {
+  const L0 = Math.log10(lo), span = Math.log10(hi) - L0, taken = [], out = [];
+  const nice = p => Number.isInteger(Math.log2(p)) || /^10*$/.test(String(p));
+  const add = p => {
+    const x = (Math.log10(p) - L0) / span * W, w = String(p).length * 6.8 + 14;
+    if (taken.some(([a, b]) => x + w / 2 > a && x - w / 2 < b)) return;
+    taken.push([x - w / 2, x + w / 2]); out.push(p);
+  };
+  P.filter(nice).forEach(add);
+  P.filter(p => !nice(p)).forEach(add);
+  return out.sort((a, b) => a - b);
+}
+function ylogOf(g, v) {
+  if (S.ylog != null) return S.ylog;
+  if (S.y === "rel") return false;
+  let lo = Infinity, hi = 0;
+  for (const c of v.shown) for (const u of g.us[c]) if (u != null && u > 0) { lo = Math.min(lo, u); hi = Math.max(hi, u); }
+  return hi / lo > 20;
+}
+
+// ================================================================ rendering
+function render() {
+  const m = S.model;
+  if (!m) return;
+  S.gi = Math.min(S.gi, m.groups.length - 1);
+  const g = curGroup(), v = S.view = computeView(g);
+  if (S.sel && (S.sel.j >= g.points.length || !g.us[S.sel.cfg])) S.sel = null;
+  document.title = `${m.name} · kernelkit`;
+  renderSources(); renderGroups(); renderHead(g, v); renderLegend(g, v);
+  renderChart(g, v); renderInspector(g, v); renderDispatch(g, v); syncControls(g, v); syncUrl();
+}
+
+const chip = (k, val) => h("span", {class: "chip"}, h("span", {class: "ck"}, k), h("b", {}, val));
+
+function renderSources() {
+  $("#sources").replaceChildren(...S.sources.map((s, i) => h("button", {class: "src" + (i === S.si ? " on" : ""), "data-i": i,
+    title: (s.url || s.name) + (s.mtime ? `\nmodified ${fmtTime(s.mtime)}` : "")}, s.name,
+    i === S.si ? h("span", {class: "meta"}, `${S.model.nrows} rows${s.mtime ? " · " + fmtTime(s.mtime) : ""}`) : null)));
+  $("#btn-live").hidden = !S.sources[S.si].url;
+}
+
+function renderGroups() {
+  const m = S.model, t = S.gfilter.trim().toLowerCase();
+  $("#group-count").textContent = m.groups.length;
+  $("#common").replaceChildren(...m.common.map(k => chip(k, m.groups[0].keys[k])));
+  $("#common").hidden = !m.common.length;
+  $("#group-filter").hidden = m.groups.length < 9;
+  $("#group-list").replaceChildren(...m.groups.filter(g => !t || g.label.toLowerCase().includes(t)).map(g => {
+    const nw = new Set(g.winner.filter(Boolean)).size;
+    return h("div", {class: "gcard" + (g.idx === S.gi ? " on" : ""), "data-i": g.idx},
+      h("div", {class: "chips"}, m.varying.length ? m.varying.map(k => chip(k, g.keys[k])) : h("span", {class: "muted"}, "all rows")),
+      h("div", {class: "gmeta"}, `${g.cfgs.length} configs · ${g.points.length} points · ${nw} winner${nw === 1 ? "" : "s"}`),
+      h("div", {class: "mini"}, g.winner.map((c, j) => h("i", {style: {background: c ? colorOf(c) : "transparent"},
+        title: `${m.bucket} ${rangeText(g, j, j)}: ${c ?? "–"}`}))));
+  }));
+}
+
+function renderHead(g, v) {
+  const m = S.model, P = g.points, n = P.length;
+  $("#title").replaceChildren(...(m.varying.length
+    ? m.varying.map((k, i) => [i ? h("span", {class: "sep"}, "·") : null, h("span", {class: "tk"}, k + "="), h("span", {class: "tv"}, g.keys[k])])
+    : [h("span", {class: "tv"}, m.name)]).flat().filter(Boolean));
+  const nw = new Set(v.win.filter(Boolean)).size;
+  const sub = [`${m.bucketCol} at ${n} point${n === 1 ? "" : "s"}${g.numeric ? ` ${P[0]} … ${P[n - 1]}` : ""} · ${g.cfgs.length} configs · ${nw} fastest somewhere`];
+  if (v.shown.length < g.cfgs.length) {
+    const a = h("a", {}, "show all");
+    a.addEventListener("click", () => { S.preset = "all"; S.filter = ""; S.hidden.clear(); S.forced.clear(); render(); });
+    sub.push(h("span", {class: "notice"}, ` · showing ${v.shown.length} of ${g.cfgs.length}: the strip, × and the ranks compare these `), a);
+  }
+  $("#subtitle").replaceChildren(...sub);
+}
+
+function renderLegend(g, v) {
+  const by = new Map(), items = [];
+  for (const c of g.order) if (filterPass(c)) (by.get(solverOf(c)) || by.set(solverOf(c), []).get(solverOf(c))).push(c);
+  for (const [s, cs] of by) {
+    items.push(h("div", {class: "lg-solver", "data-solver": s, title: `show / hide every ${s} config`},
+      h("span", {}, s), h("span", {class: "rule"}), h("span", {class: "count"}, `${cs.filter(c => v.shownSet.has(c)).length}/${cs.length}`)));
+    for (const c of cs) {
+      const k = knobsOf(c);
+      items.push(h("div", {class: "lg-item" + (v.shownSet.has(c) ? "" : " off") + (S.sel && S.sel.cfg === c ? " sel" : ""), "data-cfg": c,
+          title: `${c}\nfastest at ${g.wins[c]} of ${g.points.length} points · geomean ${fmtRel(g.geo[c])} the fastest · rows at ${g.count[c]} points`},
+        swatch(c), h("span", {class: "lg-name"}, k ? [h("span", {class: "pre"}, s + " "), k] : c),
+        h("span", {class: "lg-stat"}, g.wins[c] ? h("span", {class: "star"}, "★" + g.wins[c]) : null, "×" + g.geo[c].toFixed(2))));
+    }
+  }
+  if (!items.length) items.push(h("div", {class: "muted", style: {padding: "8px 4px"}}, "no config matches the filter"));
+  $("#legend").replaceChildren(...items);
+  $("#cfg-count").textContent = `${v.shown.length}/${g.cfgs.length} shown`;
+}
+
+const PCONF = {responsive: true, displaylogo: false,
+  modeBarButtonsToRemove: ["select2d", "lasso2d", "autoScale2d", "toggleSpikelines", "hoverClosestCartesian", "hoverCompareCartesian"],
+  toImageButtonOptions: {format: "png", scale: 2, filename: "kernelkit-tuned"}};
+
+function renderChart(g, v) {
+  const gd = $("#chart");
+  if (!window.Plotly) {
+    gd.replaceChildren(h("div", {class: "chart-error"},
+      "Plotly did not load from cdn.plot.ly: offline, blocked, or the file did not match the page's integrity hash "
+      + "(the browser console, F12, says which). The dispatch map, the legend and the groups still work."));
+    return;
+  }
+  const m = S.model, T = themeColors(), P = g.points, n = P.length;
+  const xlog = g.numeric && P[0] > 0 && S.xlog, rel = S.y === "rel", ylog = ylogOf(g, v);
+  const ax = x => xlog ? Math.log10(x) : x;
+  const edges = g.numeric ? edgesOf(P, xlog) : null;
+  const W = Math.max(240, gd.clientWidth - 66 - 16);
+  const focus = S.sel && v.shownSet.has(S.sel.cfg) ? S.sel.cfg : null;
+  const traces = [], idx = {};
+
+  // the strip: the fastest shown config of every bucket range (a heatmap row under the lines)
+  const winners = [...new Set(v.win.filter(Boolean))], k = Math.max(1, winners.length);
+  traces.push({
+    type: "heatmap", xaxis: "x", yaxis: "y2", x: g.numeric ? edges : P, y: [0, 1],
+    z: [v.win.map(c => c == null ? null : winners.indexOf(c))],
+    text: [v.win.map((c, j) => c == null ? `${escP(m.bucket)} ${rangeText(g, j, j)}: no shown config`
+      : `${escP(m.bucket)} ${rangeText(g, j, j)} → <b>${escP(c)}</b><br>${fmtUs(v.best[j])} us`
+        + (v.second[j] != null ? ` · runner-up ${fmtDelta(v.second[j] / v.best[j])}` : ""))],
+    colorscale: winners.length ? winners.flatMap((c, i) => [[i / k, colorOf(c)], [(i + 1) / k, colorOf(c)]]) : [[0, T.track], [1, T.track]],
+    zmin: -0.5, zmax: k - 0.5, showscale: false, xgap: 1.5, hoverongaps: false, hovertemplate: "%{text}<extra></extra>",
+  });
+
+  // one line per shown config: the slowest first so that the fastest lie on top, the selected one last
+  const order = [...v.shown].sort((a, b) => g.geo[b] - g.geo[a] || natCmp(b, a));
+  if (focus) order.push(...order.splice(order.indexOf(focus), 1));
+  for (const c of order) {
+    const col = colorOf(c), y = [], cd = [];
+    for (let j = 0; j < n; j++) {
+      const u = g.us[c][j];
+      if (u == null) { y.push(null); cd.push(null); continue; }
+      const r = u / v.best[j];
+      y.push(rel ? r : u);
+      cd.push([String(P[j]), fmtUs(u), v.win[j] === c ? "fastest" : fmtDelta(r) + " vs fastest", `${v.rank[c][j]}/${v.nShown[j]}`]);
+    }
+    idx[c] = traces.length;
+    traces.push({
+      type: "scatter", mode: "lines+markers", name: c, x: P, y, customdata: cd, connectgaps: false,
+      opacity: !focus || c === focus ? 1 : 0.3,
+      line: {color: col, width: c === focus ? 3.4 : 2},
+      marker: {color: col, size: c === focus ? 9 : 7, symbol: symbolOf(c), line: {color: T.plot, width: 1}},
+      hoverlabel: {bordercolor: col},
+      hovertemplate: `<b>${escP(c)}</b><br>${escP(m.bucket)} %{customdata[0]}<br>%{customdata[1]} us · %{customdata[2]}`
+        + "<br>rank %{customdata[3]}<extra></extra>",
+    });
+  }
+  const shapes = [];
+  if (S.sel) {
+    const j = S.sel.j, u = g.us[S.sel.cfg][j];
+    if (focus && u != null) traces.push({type: "scatter", mode: "markers", x: [P[j]], y: [rel ? u / v.best[j] : u], hoverinfo: "skip",
+      marker: {size: 19, color: "rgba(0,0,0,0)", line: {color: colorOf(focus), width: 2.5}}});
+    shapes.push({type: "line", xref: "x", yref: "paper", x0: P[j], x1: P[j], y0: 0, y1: 1, layer: "below",
+                 line: {color: T.muted, width: 1, dash: "dot"}});
+    if (g.numeric) shapes.push({type: "rect", xref: "x", yref: "y2", x0: edges[j], x1: edges[j + 1], y0: -0.2, y1: 1.2,
+                                line: {color: T.text, width: 2.5}, fillcolor: "rgba(0,0,0,0)"});
+  }
+  // the winners' names on the strip, where they fit
+  const anns = [{xref: "paper", yref: "y2", x: 0, y: 0.5, xanchor: "right", xshift: -8, showarrow: false, text: "fastest",
+                 font: {size: 10, color: T.muted}}];
+  if (g.numeric) {
+    const span = ax(edges[n]) - ax(edges[0]);
+    for (const r of runs(v.win)) {
+      const a = ax(edges[r.a]), b = ax(edges[r.b + 1]);
+      if (!r.cfg || (b - a) / span * W < r.cfg.length * 6.5 + 14) continue;
+      anns.push({xref: "x", yref: "y2", x: (a + b) / 2, y: 0.5, showarrow: false, text: escP(r.cfg),
+                 font: {family: MONO, size: 10.5, color: textOn(colorOf(r.cfg))}});
+    }
+  }
+  let yrange;
+  if (rel) {
+    let top = 1;
+    for (const c of v.shown) g.us[c].forEach((u, j) => { if (u != null) top = Math.max(top, u / v.best[j]); });
+    top = Math.min(top, S.cap);
+    const pad = Math.max((top - 1) * 0.05, 0.004);
+    yrange = ylog ? [Math.log10(1 - pad), Math.log10(top + pad)] : [1 - pad, top + pad];
+  }
+  const ticks = g.numeric && xlog ? pickTicks(P, W, edges[0], edges[n]) : null;
+  const layout = {
+    uirevision: [S.si, g.idx, S.y, xlog, ylog, S.cap].join("|"),
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: T.plot,
+    font: {family: SANS, size: 12, color: T.text},
+    margin: {l: 66, r: 16, t: 10, b: 46},
+    showlegend: false, hovermode: "closest", dragmode: "zoom",
+    hoverlabel: {bgcolor: T.panel, bordercolor: T.border2, font: {family: MONO, size: 12, color: T.text}, align: "left"},
+    xaxis: {
+      type: g.numeric ? (xlog ? "log" : "linear") : "category", anchor: "y2",
+      range: g.numeric ? [ax(edges[0]), ax(edges[n])] : [-0.5, n - 0.5], autorange: false,
+      title: {text: m.bucketCol, font: {family: MONO, size: 12, color: T.muted}},
+      gridcolor: T.grid, linecolor: T.border2, zeroline: false, ticks: "outside", ticklen: 4, tickcolor: T.border2,
+      tickfont: {family: MONO, size: 11, color: T.muted},
+      tickvals: ticks || undefined, ticktext: ticks ? ticks.map(String) : undefined,
+      showspikes: true, spikemode: "across", spikesnap: "data", spikethickness: 1, spikedash: "dot", spikecolor: T.muted,
+    },
+    yaxis: {
+      domain: [0.135, 1], type: ylog ? "log" : "linear", range: yrange, autorange: !yrange,
+      title: {text: rel ? "× the fastest shown at the point" : "us", font: {size: 12, color: T.muted}},
+      gridcolor: T.grid, linecolor: T.border2, zeroline: false, tickfont: {family: MONO, size: 11, color: T.muted},
+      tickformat: rel ? ".3~f" : undefined, ticksuffix: rel ? "×" : undefined,
+    },
+    yaxis2: {domain: [0, 0.07], range: [0, 1], fixedrange: true, visible: false},
+    shapes, annotations: anns,
+  };
+  Plotly.react(gd, traces, layout, PCONF);
+  S.traceIdx = idx;
+  if (!gd.kkBound) {
+    gd.kkBound = true;
+    gd.on("plotly_click", onPlotClick);
+    gd.on("plotly_relayout", () => placeInspector());
+  }
+}
+
+function onPlotClick(ev) {
+  const pt = ev && ev.points && ev.points[0];
+  if (!pt || !S.model) return;
+  const g = curGroup();
+  if (pt.data.type === "heatmap") {
+    const pn = pt.pointIndex ?? pt.pointNumber, j = Array.isArray(pn) ? pn[pn.length - 1] : pn;
+    if (S.view.win[j]) select(S.view.win[j], j, false);
+  } else if (pt.data.name && g.us[pt.data.name]) select(pt.data.name, pt.pointIndex);
+}
+
+// Legend hover: the hovered config stands out (no re-render).
+function emphasize() {
+  const gd = $("#chart");
+  if (!window.Plotly || !gd.data) return;
+  const has = c => c != null && S.traceIdx[c] != null;
+  const f = has(S.hover) ? S.hover : S.sel && has(S.sel.cfg) ? S.sel.cfg : null, strong = has(S.hover);
+  const ids = [], op = [], lw = [], ms = [];
+  for (const [c, i] of Object.entries(S.traceIdx)) {
+    ids.push(i); op.push(!f || c === f ? 1 : strong ? 0.1 : 0.3); lw.push(c === f ? 3.4 : 2); ms.push(c === f ? 9 : 7);
+  }
+  if (ids.length) Plotly.restyle(gd, {opacity: op, "line.width": lw, "marker.size": ms}, ids);
+}
+
+const kpi = (k, val, unit, cls) => h("div", {class: "kpi"}, h("div", {class: "k", title: k}, k),
+  h("div", {class: "v" + (cls ? " " + cls : ""), title: String(val)}, val, unit ? h("small", {}, " " + unit) : null));
+const fact = (k, val) => h("div", {class: "fact"}, h("span", {class: "fk"}, k), h("span", {class: "fv"}, val));
+
+function renderInspector(g, v) {
+  const box = $("#inspector");
+  if (!S.sel) { box.hidden = true; box.replaceChildren(); return; }
+  const m = S.model, {cfg, j} = S.sel, P = g.points, n = P.length;
+  const u = g.us[cfg][j], row = g.rowOf[cfg][j], r = u != null && v.best[j] ? u / v.best[j] : null;
+  const d = u == null ? ["no row", "muted"] : v.win[j] === cfg ? ["fastest", "good"] : [fmtDelta(r), deltaClass(r)];
+  // every config at this point, the fastest first; the hidden ones dimmed
+  const have = g.cfgs.filter(c => g.us[c][j] != null).sort((a, b) => g.us[a][j] - g.us[b][j]);
+  const missing = g.cfgs.filter(c => g.us[c][j] == null);
+  const list = h("div", {class: "rank"}, have.map(c => {
+    const uc = g.us[c][j], rc = v.best[j] ? uc / v.best[j] : null, on = v.shownSet.has(c);
+    return h("div", {class: "rk" + (on ? "" : " off") + (c === cfg ? " sel" : ""), "data-cfg": c, title: on ? c : c + " (hidden)"},
+      h("span", {class: "n"}, on ? v.rank[c][j] : "·"), swatch(c, 22), h("span", {class: "nm"}, c), h("span", {class: "us"}, fmtUs(uc)),
+      h("span", {class: "bar"}, h("i", {style: {width: Math.max(3, Math.min(100, 100 / (rc || 1))).toFixed(1) + "%", background: colorOf(c)}})),
+      h("span", {class: "d " + (c === v.win[j] ? "good" : deltaClass(rc))}, c === v.win[j] ? "fastest" : fmtDelta(rc)));
+  }), missing.length ? h("div", {class: "rk-miss"}, "no row: " + missing.join(", ")) : null);
+  // this config over the bucket
+  const near = runs(P.map((_, i) => g.us[cfg][i] != null && v.best[i] != null && g.us[cfg][i] <= v.best[i] * 1.02 ? "y" : null));
+  const wins = runs(v.win).filter(x => x.cfg === cfg).map(x => rangeText(g, x.a, x.b));
+  const na = P.filter((_, i) => g.us[cfg][i] == null);
+  box.replaceChildren(
+    h("div", {class: "in-head"}, swatch(cfg, 30),
+      h("div", {}, h("div", {class: "in-name", title: cfg}, cfg),
+        h("div", {class: "in-sub"}, `${m.bucketCol} = ${P[j]}`, m.varying.length ? ` · ${g.label}` : "")),
+      h("button", {class: "icon-btn", title: "close (Esc)", "data-close": "1"}, "✕")),
+    h("div", {class: "kpis"},
+      kpi("time", u == null ? "n/a" : fmtUs(u), u == null ? "" : "us"),
+      kpi("vs fastest", d[0], "", d[1]),
+      kpi("rank", u == null ? "–" : v.shownSet.has(cfg) ? `${v.rank[cfg][j]}/${v.nShown[j]}` : "hidden"),
+      m.metricIdx.map(i => kpi(m.fields[i], row ? row[i] : "–"))),
+    h("div", {class: "in-sec"}, `${have.length} configs at ${m.bucket} = ${P[j]}`),
+    list,
+    h("div", {class: "in-sec", title: cfg}, `${cfg} over ${m.bucket}`),
+    h("div", {class: "facts"},
+      fact("fastest shown", wins.length ? wins.join(" · ") : "nowhere"),
+      fact("within 2%", near.filter(x => x.cfg).map(x => rangeText(g, x.a, x.b)).join(" · ") || "nowhere"),
+      fact("of all configs", `fastest at ${g.wins[cfg]} of ${n} points · geomean ${fmtRel(g.geo[cfg])}`),
+      na.length ? fact("no row at", na.join(", ")) : null),
+    row ? h("details", {class: "in-row", open: S.rowOpen}, h("summary", {}, "the row in the table"),
+      h("div", {class: "kv"}, m.fields.map((f, i) => [h("span", {class: "k"}, f), h("span", {class: "v"}, row[i] ?? "")]))) : null,
+    h("div", {class: "in-actions"},
+      h("button", {class: "btn sm", "data-copy": "name"}, "Copy name"),
+      row ? h("button", {class: "btn sm", "data-copy": "row"}, "Copy row") : null,
+      h("span", {class: "grow"}), h("span", {class: "hint"}, h("kbd", {}, "←"), h("kbd", {}, "→"), " step")));
+  box.hidden = false;
+  placeInspector();
+  const cur = list.querySelector(".rk.sel");
+  if (cur) list.scrollTop = cur.offsetTop - (list.clientHeight - cur.offsetHeight) / 2;
+}
+
+// The inspector sits on the half of the plot away from the selected point.
+function placeInspector() {
+  const box = $("#inspector"), gd = $("#chart");
+  if (!S.sel || box.hidden || !S.model) return;
+  const g = curGroup(), xa = gd.layout && gd.layout.xaxis;
+  let f = (S.sel.j + 0.5) / g.points.length;
+  if (g.numeric && xa && Array.isArray(xa.range)) {
+    const p = g.points[S.sel.j], pa = xa.type === "log" ? Math.log10(p) : p;
+    f = (pa - xa.range[0]) / (xa.range[1] - xa.range[0]);
+  }
+  if (S.inSide === "right" && f > 0.56) S.inSide = "left";
+  else if (S.inSide === "left" && f < 0.44) S.inSide = "right";
+  box.classList.toggle("left", S.inSide === "left");
+}
+
+function renderDispatch(g, v) {
+  const m = S.model;
+  $("#dt-range").textContent = m.bucketCol;
+  $("#dispatch-note").textContent = g.numeric ? `a call with ${m.bucket} in (previous point, point] runs the config tuned fastest at the point;`
+    + " the last point takes every larger call" : "";
+  $("#dispatch").replaceChildren(...runs(v.win).map(r => {
+    const us = [];
+    let lead = Infinity;
+    for (let j = r.a; j <= r.b; j++) {
+      if (v.best[j] != null) us.push(v.best[j]);
+      if (v.second[j] != null) lead = Math.min(lead, v.second[j] / v.best[j]);
+    }
+    const lo = Math.min(...us), hi = Math.max(...us);
+    return h("tr", {class: S.sel && S.sel.j >= r.a && S.sel.j <= r.b ? "cur" : "", "data-a": r.a, "data-cfg": r.cfg ?? ""},
+      h("td", {class: "mono"}, rangeText(g, r.a, r.b)),
+      h("td", {}, r.cfg ? h("span", {class: "cfgcell"}, swatch(r.cfg, 22), r.cfg) : h("span", {class: "muted"}, "no shown config")),
+      h("td", {class: "num"}, us.length ? (lo === hi ? fmtUs(lo) : `${fmtUs(lo)} – ${fmtUs(hi)}`) : "–"),
+      h("td", {class: "num" + (lead < 1.01 ? " warn" : ""), title: lead < 1.01 ? "a close call: within 1%" : ""},
+        Number.isFinite(lead) ? fmtDelta(lead) : "–"),
+      h("td", {class: "num"}, r.b - r.a + 1));
+  }));
+}
+
+function syncControls(g, v) {
+  const seg = (sel, val) => { for (const b of $(sel).querySelectorAll("button")) b.classList.toggle("on", b.dataset.v === val); };
+  const canLog = g.numeric && g.points[0] > 0;
+  seg("#seg-y", S.y);
+  seg("#seg-xs", canLog && S.xlog ? "log" : "lin");
+  $('#seg-xs [data-v="log"]').disabled = !canLog;
+  seg("#seg-ys", ylogOf(g, v) ? "log" : "lin");
+  seg("#presets", S.preset);
+  $("#cap-wrap").hidden = S.y !== "rel";
+  $("#cap").value = Number.isFinite(S.cap) ? String(S.cap) : "inf";
+  if ($("#cfg-filter").value !== S.filter) $("#cfg-filter").value = S.filter;
+}
+
+// The view goes into the address (replaceState), so a reload or a copied link shows the same.
+const VIEW_KEYS = ["group", "y", "xscale", "yscale", "clip", "show", "sel", "src"];
+function syncUrl() {
+  const m = S.model, g = curGroup(), p = new URLSearchParams(location.search);
+  VIEW_KEYS.forEach(k => p.delete(k));
+  if (S.si) p.set("src", S.si);
+  if (m.groups.length > 1 && m.varying.length) p.set("group", m.varying.map(k => `${k}=${g.keys[k]}`).join(","));
+  if (S.y !== "us") p.set("y", S.y);
+  if (!S.xlog) p.set("xscale", "lin");
+  if (S.ylog != null) p.set("yscale", S.ylog ? "log" : "lin");
+  if (S.cap !== 1.5) p.set("clip", Number.isFinite(S.cap) ? S.cap : "inf");
+  if (S.preset !== "all") p.set("show", S.preset);
+  if (S.sel) p.set("sel", `${S.sel.cfg}@${g.points[S.sel.j]}`);
+  const q = p.toString(), url = location.pathname + (q ? "?" + q : "") + location.hash;
+  try { if (url !== location.pathname + location.search + location.hash) history.replaceState(null, "", url); }
+  catch (e) { /* e.g. a file: page that may not change its address */ }
+}
+function applyView(p) {
+  const m = S.model;
+  if (p.has("group")) {
+    const want = p.get("group").split(",").map(s => s.split("=")).filter(a => a.length === 2);
+    const i = m.groups.findIndex(g => want.every(([k, val]) => g.keys[k] === val));
+    if (i >= 0) S.gi = i;
+  }
+  if (p.get("y") === "rel") S.y = "rel";
+  if (p.get("xscale") === "lin") S.xlog = false;
+  if (p.has("yscale")) S.ylog = p.get("yscale") === "log";
+  if (p.has("clip")) { const c = p.get("clip") === "inf" ? Infinity : +p.get("clip"); if (CAPS.includes(c)) S.cap = c; }
+  if (["win", "top3"].includes(p.get("show"))) S.preset = p.get("show");
+  const sel = p.get("sel") || "", at = sel.lastIndexOf("@");
+  if (at > 0) {
+    const g = curGroup(), c = sel.slice(0, at), j = g.points.findIndex(x => String(x) === sel.slice(at + 1));
+    if (j >= 0 && g.us[c]) S.sel = {cfg: c, j};
+  }
+}
+
+// ================================================================ actions
+function select(c, j, toggle = true) {
+  S.sel = c == null || (toggle && S.sel && S.sel.cfg === c && S.sel.j === j) ? null : {cfg: c, j};
+  render();
+}
+function setGroup(i) {
+  if (i === S.gi) return;
+  const old = curGroup(), keep = S.sel && {cfg: S.sel.cfg, x: String(old.points[S.sel.j])};
+  S.gi = i; S.sel = null;
+  const g = curGroup();
+  if (keep) {  // the same config at the same point, when the group has it
+    const j = g.points.findIndex(p => String(p) === keep.x);
+    if (j >= 0 && g.us[keep.cfg]) S.sel = {cfg: keep.cfg, j};
+  }
+  render();
+  const card = $("#group-list .gcard.on");
+  if (card) card.scrollIntoView({block: "nearest"});
+}
+function resetShown() { S.hidden.clear(); S.forced.clear(); S.preset = "all"; S.sel = null; S.gi = 0; }
+
+function setSources(list, params) {
+  let model;
+  const si = params ? Math.max(0, Math.min(list.length - 1, parseInt(params.get("src") || "0", 10) || 0)) : 0;
+  try { model = buildModel(list[si].text, list[si].name); } catch (e) { fail(e); return; }
+  S.sources = list; S.si = si; S.model = model; colorCache.clear(); resetShown();
+  if (params) applyView(params);
+  $("#empty").hidden = true; $("#app").hidden = false;
+  render();
+  setLive(!!list[si].url && (S.live || !!(params && params.get("live") === "1")));
+}
+function setSource(i) {
+  if (i === S.si) return;
+  let model;
+  try { model = buildModel(S.sources[i].text, S.sources[i].name); } catch (e) { fail(e); return; }
+  S.si = i; S.model = model; colorCache.clear(); resetShown();
+  render();
+  setLive(S.live && !!S.sources[i].url);
+}
+// A re-read table: keep the group, the selection and the colors of the configs it had.
+function swapModel(m) {
+  const old = S.model, og = curGroup(), keep = S.sel && {cfg: S.sel.cfg, x: String(og.points[S.sel.j])};
+  let next = Math.max(-1, ...old.cindex.values()) + 1;
+  for (const c of [...m.cindex.keys()]) m.cindex.set(c, old.cindex.has(c) ? old.cindex.get(c) : next++);
+  S.model = m; colorCache.clear(); S.sel = null;
+  S.gi = Math.max(0, m.groups.findIndex(g => m.keys.every(k => g.keys[k] === og.keys[k])));
+  const g = curGroup();
+  if (keep) {
+    const j = g.points.findIndex(p => String(p) === keep.x);
+    if (j >= 0 && g.us[keep.cfg]) S.sel = {cfg: keep.cfg, j};
+  }
+  render();
+}
+
+// ================================================================ loading
+const rawUrl = u => u.replace(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+)$/, "https://raw.githubusercontent.com/$1/$2/$3");
+function nameOf(u) {
+  try { return decodeURIComponent(new URL(u, location.href).pathname.split("/").pop()) || u; } catch (e) { return u; }
+}
+async function fetchText(url) {
+  const u = rawUrl(url);
+  if (!["http:", "https:", "file:"].includes(new URL(u, location.href).protocol)) throw new Error(`${url}: not an http(s) URL`);
+  let res;
+  try { res = await fetch(u, {cache: "no-store"}); }
+  catch (e) {
+    throw new Error(`could not fetch ${u} (${e.message}). ` + (location.protocol === "file:"
+      ? "A page opened from a file cannot fetch: use Open…, or python -m kernelkit plot TABLE.csv."
+      : "Is the URL right, and does its server allow cross-origin reads (CORS)?"));
+  }
+  if (!res.ok) throw new Error(`${u}: HTTP ${res.status} ${res.statusText}`);
+  const lm = res.headers.get("Last-Modified");
+  return {text: await res.text(), mtime: lm ? new Date(lm) : null};
+}
+async function loadUrls(urls, params) {
+  try {
+    toast(`loading ${urls.map(u => nameOf(rawUrl(u))).join(", ")} …`);
+    const list = [];
+    for (const u of urls) list.push({name: nameOf(rawUrl(u)), url: u, ...await fetchText(u)});
+    $("#toast").hidden = true;
+    if (!params) {  // typed in: put it into the address
+      const p = new URLSearchParams();
+      urls.forEach(u => p.append("csv", u));
+      try { history.replaceState(null, "", location.pathname + "?" + p); } catch (e) { /* file: page */ }
+    }
+    setSources(list, params);
+  } catch (e) { fail(e); }
+}
+async function openFiles(files) {
+  try {
+    const list = await Promise.all([...files].map(async f => ({name: f.name, text: await f.text(), mtime: new Date(f.lastModified)})));
+    if (!list.length) return;
+    try { history.replaceState(null, "", location.pathname); } catch (e) { /* file: page */ }
+    setLive(false);
+    setSources(list, null);
+  } catch (e) { fail(e); }
+}
+// data=z:...: deflate-raw, base64url (what "Copy link" writes for a table that has no URL)
+async function decodeData(s) {
+  if (!s.startsWith("z:")) return s;
+  const b64 = s.slice(2).replace(/-/g, "+").replace(/_/g, "/");
+  const bin = Uint8Array.from(atob(b64 + "=".repeat((4 - b64.length % 4) % 4)), ch => ch.charCodeAt(0));
+  return await new Response(new Blob([bin]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).text();
+}
+async function encodeData(text) {
+  const buf = new Uint8Array(await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+  return "z:" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+let liveTimer = 0, liveBusy = false;
+function setLive(on) {
+  S.live = on;
+  $("#btn-live").classList.toggle("on", on);
+  clearInterval(liveTimer);
+  if (on) liveTimer = setInterval(pollLive, 2000);
+}
+async function pollLive() {
+  const src = S.sources[S.si];
+  if (!src || !src.url || liveBusy || document.hidden) return;
+  liveBusy = true;
+  try {
+    const {text, mtime} = await fetchText(src.url);
+    if (text !== src.text && S.sources[S.si] === src) {
+      const m = buildModel(text, src.name);
+      src.text = text; src.mtime = mtime;
+      swapModel(m);
+      toast(`${src.name} changed: reloaded (${fmtTime(new Date())})`);
+    }
+  } catch (e) { /* keep showing the last good table */ }
+  finally { liveBusy = false; }
+}
+
+async function copy(text, what) {
+  try { await navigator.clipboard.writeText(text); toast(`copied the ${what}`); }
+  catch (e) { window.prompt(`Copy the ${what}:`, text); }
+}
+async function copyLink() {
+  const src = S.sources[S.si];
+  if (!src) return toast("nothing to link to: open a table first");
+  if (src.url) return copy(location.href, "link");
+  const u = new URL(location.href);  // a local file: the table goes into the link
+  u.hash = new URLSearchParams({data: await encodeData(src.text), name: src.name}).toString();
+  copy(u.href, `link (${src.name} is inside it, ${Math.round(u.href.length / 1024)} KB)`);
+}
+
+let toastTimer = 0;
+function toast(msg, err) {
+  const t = $("#toast");
+  t.textContent = msg; t.className = "toast" + (err ? " err" : ""); t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, err ? 8000 : 2400);
+}
+function fail(e) {
+  console.error(e);
+  toast(String(e && e.message || e), true);
+  if (!S.model) { $("#app").hidden = true; $("#empty").hidden = false; }
+}
+function toggleUrlBar(on) {
+  const bar = $("#urlbar");
+  on = on ?? bar.hidden;
+  bar.hidden = !on;
+  if (on) {
+    const src = S.sources[S.si];
+    $("#url-input").value = src && src.url && /^https?:/.test(src.url) ? src.url : "";
+    $("#url-input").focus();
+  }
+}
+function toggleTheme() {
+  const t = theme() === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("kk-theme", t); } catch (e) { /* no storage */ }
+  render();
+}
+
+// A made-up table: a GEMM-like op with crossing configs, two dtypes, n/a points.
+function demoCSV() {
+  const pts = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
+  const cost = {
+    "torch": m => 9 + 0.0100 * m,
+    "tile m16": m => 6.0 + 0.0105 * m + (m > 2048 ? 0.002 * m : 0),
+    "tile m32 k2": m => 6.8 + 0.0090 * m,
+    "tile m64 k2": m => 8.4 + 0.0072 * m,
+    "tile m128 k4": m => m < 64 ? null : 12 + 0.0061 * m,
+    "stream k8": m => 7.4 + 0.0080 * m + 0.23 * Math.log2(m),
+  };
+  const lines = ["dtype,~m,config,us,err"];
+  for (const dt of ["bf16", "fp8"]) {
+    for (const m of pts) {
+      const rows = [];
+      for (const [c, f] of Object.entries(cost)) {
+        let us = f(m);
+        if (us == null) continue;
+        if (dt === "fp8") us *= c === "torch" ? 1 : c.startsWith("stream") ? 0.48 : 0.62;
+        rows.push([c, us * (1 + 0.015 * Math.sin(m * 0.7 + c.length * 1.3))]);
+      }
+      rows.sort((a, b) => a[1] - b[1]);
+      for (const [c, us] of rows) lines.push(`${dt},${m},${c},${us.toFixed(1)},${dt === "fp8" ? "2.1e-02" : "3.4e-03"}`);
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+// ================================================================ events
+function onKey(e) {
+  if ((e.target.closest && e.target.closest("input, select, textarea")) || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (e.key === "Escape") {
+    if (!$("#urlbar").hidden) toggleUrlBar(false);
+    else if (S.sel) select(null);
+    return;
+  }
+  if (!S.model) return;
+  const g = curGroup();
+  if (["ArrowUp", "ArrowDown"].includes(e.key)) {
+    const t = S.gfilter.trim().toLowerCase();
+    const vis = S.model.groups.filter(x => !t || x.label.toLowerCase().includes(t)).map(x => x.idx);
+    const pos = vis.indexOf(S.gi), next = vis[Math.max(0, Math.min(vis.length - 1, pos + (e.key === "ArrowUp" ? -1 : 1)))];
+    if (next != null) setGroup(next);
+    e.preventDefault();
+  } else if (["ArrowLeft", "ArrowRight"].includes(e.key) && S.sel) {
+    const j = S.sel.j + (e.key === "ArrowLeft" ? -1 : 1);
+    if (j >= 0 && j < g.points.length) select(S.sel.cfg, j, false);
+    e.preventDefault();
+  }
+}
+
+function wire() {
+  const onBtn = (sel, fn) => $(sel).addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (b && !b.disabled) fn(b.dataset.v);
+  });
+  $("#btn-open").addEventListener("click", () => $("#file").click());
+  $("#file").addEventListener("change", e => { openFiles(e.target.files); e.target.value = ""; });
+  $("#btn-url").addEventListener("click", () => toggleUrlBar());
+  $("#url-cancel").addEventListener("click", () => toggleUrlBar(false));
+  $("#urlbar").addEventListener("submit", e => {
+    e.preventDefault();
+    const u = $("#url-input").value.trim();
+    if (u) { toggleUrlBar(false); setLive(false); loadUrls([u], null); }
+  });
+  $("#btn-theme").addEventListener("click", toggleTheme);
+  $("#btn-live").addEventListener("click", () => setLive(!S.live));
+  $("#btn-link").addEventListener("click", copyLink);
+  $("#sources").addEventListener("click", e => { const b = e.target.closest(".src"); if (b) setSource(+b.dataset.i); });
+  $("#empty").addEventListener("click", e => {
+    const b = e.target.closest("[data-act]");
+    if (!b) return;
+    if (b.dataset.act === "open") $("#file").click();
+    else if (b.dataset.act === "url") toggleUrlBar(true);
+    else setSources([{name: "demo_tuned.csv", text: demoCSV()}], null);
+  });
+  onBtn("#seg-y", v => { S.y = v; S.ylog = null; render(); });
+  onBtn("#seg-xs", v => { S.xlog = v === "log"; render(); });
+  onBtn("#seg-ys", v => { S.ylog = v === "log"; render(); });
+  onBtn("#presets", v => { S.preset = v; S.hidden.clear(); S.forced.clear(); render(); });
+  $("#cap").addEventListener("change", e => { S.cap = e.target.value === "inf" ? Infinity : +e.target.value; render(); });
+  $("#cfg-filter").addEventListener("input", e => { S.filter = e.target.value; render(); });
+  $("#group-filter").addEventListener("input", e => { S.gfilter = e.target.value; renderGroups(); });
+  $("#group-list").addEventListener("click", e => { const c = e.target.closest(".gcard"); if (c) setGroup(+c.dataset.i); });
+
+  // legend: a click toggles (after the double-click delay), a double click shows only that config
+  const lg = $("#legend");
+  let clickTimer = 0;
+  lg.addEventListener("click", e => {
+    const g = curGroup(), head = e.target.closest(".lg-solver"), it = e.target.closest(".lg-item");
+    if (head) {
+      const cs = g.cfgs.filter(c => solverOf(c) === head.dataset.solver && filterPass(c)), on = !cs.some(c => isShown(g, c));
+      cs.forEach(c => setShown(g, c, on));
+      render();
+    } else if (it) {
+      const c = it.dataset.cfg;
+      clearTimeout(clickTimer);
+      if (e.detail >= 2) { isolate(g, c); render(); }
+      else clickTimer = setTimeout(() => { setShown(g, c, !isShown(g, c)); render(); }, 230);
+    }
+  });
+  lg.addEventListener("mouseover", e => {
+    const it = e.target.closest(".lg-item"), c = it ? it.dataset.cfg : null;
+    if (c !== S.hover) { S.hover = c; emphasize(); }
+  });
+  lg.addEventListener("mouseleave", () => { if (S.hover) { S.hover = null; emphasize(); } });
+
+  const ins = $("#inspector");
+  ins.addEventListener("click", e => {
+    const t = e.target;
+    if (t.closest("[data-close]")) return select(null);
+    const cp = t.closest("[data-copy]");
+    if (cp) {
+      const g = curGroup();
+      return cp.dataset.copy === "name" ? copy(S.sel.cfg, "config name") : copy(csvLine(g.rowOf[S.sel.cfg][S.sel.j]), "CSV row");
+    }
+    const rk = t.closest(".rk");
+    if (rk) select(rk.dataset.cfg, S.sel.j, false);
+  });
+  ins.addEventListener("toggle", e => { if (e.target.matches("details")) S.rowOpen = e.target.open; }, true);
+  $("#dispatch").addEventListener("click", e => {
+    const tr = e.target.closest("tr");
+    if (tr && tr.dataset.cfg) select(tr.dataset.cfg, +tr.dataset.a, false);
+  });
+  document.addEventListener("keydown", onKey);
+
+  // drop files anywhere
+  const files = e => e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+  let depth = 0;
+  window.addEventListener("dragenter", e => { if (files(e)) { depth++; $("#veil").hidden = false; e.preventDefault(); } });
+  window.addEventListener("dragover", e => { if (files(e)) e.preventDefault(); });
+  window.addEventListener("dragleave", e => { if (files(e) && --depth <= 0) { depth = 0; $("#veil").hidden = true; } });
+  window.addEventListener("drop", e => {
+    if (!files(e)) return;
+    e.preventDefault(); depth = 0; $("#veil").hidden = true;
+    openFiles(e.dataTransfer.files);
+  });
+  let rt = 0;  // the ticks and the strip labels depend on the width
+  window.addEventListener("resize", () => {
+    clearTimeout(rt);
+    rt = setTimeout(() => { if (S.model) renderChart(curGroup(), S.view); }, 150);
+  });
+}
+
+async function init() {
+  wire();
+  const p = new URLSearchParams(location.search);
+  new URLSearchParams(location.hash.slice(1)).forEach((val, key) => p.append(key, val));
+  try {
+    const embedded = window.KK_EMBEDDED;
+    if (Array.isArray(embedded) && embedded.length) {
+      return setSources(embedded.map(t => ({name: String(t.name), text: String(t.text)})), p);
+    }
+    if (p.has("data")) return setSources([{name: p.get("name") || "table.csv", text: await decodeData(p.get("data"))}], p);
+    const urls = p.getAll("csv").filter(Boolean);
+    if (urls.length) return await loadUrls(urls, p);
+  } catch (e) { fail(e); }
+  if (!S.model) $("#empty").hidden = false;
+}
+init();
+})();
+</script>
+</body>
+</html>

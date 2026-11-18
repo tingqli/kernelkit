@@ -23,5 +23,8 @@ Homepage = "https://github.com/tingqli/kernelkit"
 [tool.setuptools]
 packages = ["kernelkit"]
 
+[tool.setuptools.package-data]
+kernelkit = ["plot.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -6,7 +6,8 @@
 - **调优**：`python -m kernelkit tune ...` 在 GPU 上测每个配置，写出 CSV 调优表；
 - **分派**：`ops.axpy(x, y)` 按调优表选最快的配置运行；
 - **实验**：`python -m kernelkit ab / check ...` 按配置名做 A/B 计时和正确性检查；
-- **多卡**：一次调用跨好几张卡的 solver 加 `@multi_gpu(8)` 或 `@multi_gpu("world")`（卡数是 problem 的 dim），以上命令自动起相应个数的进程运行（第 8 节）。
+- **多卡**：一次调用跨好几张卡的 solver 加 `@multi_gpu(8)` 或 `@multi_gpu("world")`（卡数是 problem 的 dim），以上命令自动起相应个数的进程运行（第 8 节）；
+- **看表**：`python -m kernelkit plot <表>` 在浏览器里把调优表画成折线图，看出每个配置在哪个分桶区间最快（6.6 节）。
 
 solver 用什么写都行（FlyDSL、Triton、HIP、torch……）。
 
@@ -51,6 +52,7 @@ python -m pytest kernelkit/tests      # CPU 测试，不需要 GPU
 | `kernelkit.testing` | pytest（默认的结果检查用 torch） |
 | `kernelkit.timing`、`kernelkit.tune`、`kernelkit.bench`、`python -m kernelkit` | torch 和 GPU（ROCm 或 CUDA） |
 | `kernelkit.spmd`（多卡 op 的进程和同步，第 8 节） | torch.distributed；没有 GPU 时用 gloo 在 CPU 上运行（测试用） |
+| `kernelkit.plot`、`python -m kernelkit plot`（6.6 节） | 只用标准库；页面在浏览器里从 CDN 加载 Plotly |
 
 kernelkit 不声明对 torch 的依赖，直接用环境里已经装好的 torch（不会替换掉 ROCm / CUDA 版的 torch）。
 
@@ -421,6 +423,7 @@ python -m kernelkit <命令> <模块>:<Tuning 名> [problem 或组名 ...] [选�
 | `tune-all` | `tune-all M:T [P ...] --gpus 0-7 --per-job 4 --out DIR` | 多卡调全部（或指定的）problem，合并成 `DIR/<表名>.new.csv` |
 | `compare` | `compare OLD.csv NEW.csv` | 每个调优点新旧表的最快配置，以及沿用旧配置的代价 |
 | `ab`、`check` | 见第 7 节 | |
+| `plot` | `plot T.csv ... [--out F.html]`（或 `plot M:T`） | 在浏览器里看调优表（6.6） |
 
 P 可以是 problem id 或组名（组里的每个 problem）。
 
@@ -492,6 +495,30 @@ dtype=bf16 ~n=1000  old tiled b1024    6.0  new tiled b1024    6.0  old-cfg-now 
 ### 6.5 表文件
 
 调优表是 CSV：key 列、分桶列 `~<dim>`、`config`，然后是 `us` 和 `<op>_check` 返回的指标。`config` 及之前的列是一行的身份：写入同身份的行会替换旧行。文件按身份排序，同一个点内最快的在前。可以手工编辑（删行、改时间），分派一秒内读到新内容。
+
+### 6.6 看表：plot
+
+`python -m kernelkit plot` 把调优表画成浏览器里的交互折线图（页面是 [kernelkit/plot.html](kernelkit/plot.html)，用 Plotly）：
+
+- key 列（`~<dim>` 之前的列）取值相同的行是一**组**，每组一张图：横轴是分桶值，纵轴是 `us`，每个配置一条颜色不同的折线，图例给出配置和颜色的对应（一个配置在每组里颜色相同；同一 solver 的配置用同一种点形）。配置在某个点上没有行（n/a、BAD）时折线在那里断开。
+- 图下的色带是每个分桶区间里**最快的配置**，也就是分派的选择：调用值落在 `(上一个调优点, 调优点]` 的用这个调优点上最快的配置，最后一个点也管比它大的值。下面的 Dispatch map 表按区间列出最快的配置、时间和它领先第二名多少（不到 1% 标黄：在噪声里）。
+- **点图上的点**（或色带）弹出这一点的详情：时间、比最快慢多少、名次、`<op>_check` 的指标；这个点上所有配置的排名（点一行就换成那个配置）；这个配置在哪些区间最快、哪些区间离最快不到 2%、哪些点没有行；表里的整行（可复制）。
+- 纵轴可以切换 `us` / `× fastest`（同一点上最快配置的倍数，最快的在 1 上）；x、y 各自 log / lin。
+- 右边的图例：单击显示 / 隐藏，双击只看这一个（再双击恢复），悬停高亮，点 solver 名切换这个 solver 的全部配置；搜索框按名字过滤（空格分开的词都要出现）；All / Winners / Top 3 只看在某个点上最快 / 进前三的配置。隐藏了一些配置时，色带、`× fastest` 和名次只在显示的配置之间比较。
+- 左边选组（每组下面的小色带是它的分派图）。↑/↓ 换组，←/→ 左右移动选中的点，Esc 关掉详情。视图（组、选中的点、坐标）写在地址栏里，刷新或复制链接后还是这个视图。
+
+```
+$ python -m kernelkit plot axpy_tuned.csv                 # 几张表：页面上方的标签切换；也可以写 <模块>:<Tuning 名>
+kernelkit plot: http://127.0.0.1:8765/?csv=axpy_tuned.csv&live=1
+  /axpy_tuned.csv <- .../examples/axpy/axpy_tuned.csv
+  (each table is read again on every request; Ctrl-C to stop)
+$ python -m kernelkit plot axpy_tuned.csv --out axpy.html # 一个自带表的 html 文件，可以直接发给别人
+wrote axpy.html (1 table inside): open it in a browser
+```
+
+- 服务只用标准库，只绑定 127.0.0.1（`--host` 改），只提供页面和给出的表，每次请求都重新读表；页面每 2 秒重读一次（右上角的 Live），调优一边写表一边能看到新的点。端口默认 8765，占用时往后找。在远程机器上：在 VS Code 的 Ports 面板把这个端口转发到本地，再打开打印的链接。
+- 不用服务也行：浏览器直接打开 `plot.html`，点 Open… 选本地 CSV（或拖进页面）；或者 `plot.html?csv=<url>`（`csv=` 可以写几个；对方服务器要允许跨域读取，例如 raw.githubusercontent.com；GitHub 的 blob 链接自动换成 raw 链接）；`?data=<CSV 文本>` 把表直接写在地址里。打开本地文件时 Copy link 把压缩后的表放进链接（`#data=z:...`）。
+- 页面从 cdn.plot.ly 加载固定版本的 Plotly（带完整性校验），浏览器要能访问它；加载不了时只是不画图，组、图例和 Dispatch map 照常可用。
 
 ## 7. A/B 计时与正确性检查
 
@@ -729,6 +756,11 @@ op.multi_gpu; op.world(problem)                 # 是否跨卡；一个 problem 
 from kernelkit import spmd
 spmd.rank(), spmd.world()                       # 本进程在 kernelkit 起的任务里的 rank、rank 数（任务外：0、1）
 spmd.gather(obj)                                # 各 rank 的 obj，按 rank 排列（任务外：[obj]）
+
+# 看表（标准库，6.6）
+from kernelkit import plot
+html = plot.embed([("t_tuned.csv", text)])      # 自带表的页面：一个 html 文件
+server, url = plot.serve(["t_tuned.csv"])       # 页面和表的 HTTP 服务（127.0.0.1）；server.serve_forever()
 ```
 
 `kb.ab` / `kb.check` 的钩子：`inputs(value, seed) -> 接口参数 dict`（替换 `<op>_problem`）、`annotate(inputs, resolved) -> (标题后缀, 记录字段)`（ab）、`alias(base) -> 配置名`（变体的简写）、`unit`（标题里分桶值的单位名）、`describe`（开头打印的说明）。
