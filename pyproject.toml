@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernelkit"
+version = "0.1.0"
+description = "Describe a GPU op as plain functions; get tests, a tuner, table dispatch and A/B tools"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+# The core (registry, dispatch, tables) is the standard library only. The tuner, timing and
+# bench tools import torch, kernelkit.testing imports pytest: use the ones installed (torch is
+# not a dependency, so installing kernelkit never replaces a ROCm / CUDA build of torch).
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/tingqli/kernelkit"
+
+[tool.setuptools]
+packages = ["kernelkit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
