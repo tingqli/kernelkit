@@ -44,6 +44,12 @@ passed ``<op>_check``; ``op(...)`` only picks those, so a call is guaranteed for
 tuned key only. ``@no_capture(reason)`` marks a solver that cannot run under
 CUDA-graph capture: the dispatch skips it while the current stream captures.
 
+``@multi_gpu(world, init=)`` marks a solver that runs on several GPUs at once: one
+process (a rank) per GPU, every rank calling it with its own inputs (SPMD, e.g. an
+expert-parallel MoE layer). ``world`` is their number, or the name of the dim that
+holds it (the problem says how many GPUs). Every solver of the op runs so; the tuner
+and the bench tools start the ranks themselves (``kernelkit.spmd``).
+
 Registration: ``Registry.register`` (``@op_register``) adds one function to its op and
 returns it unchanged, after checking it against the conventions below:
 
@@ -121,7 +127,7 @@ from collections.abc import Mapping
 
 from . import table as _table
 
-__all__ = ["dim", "knob", "no_capture", "meta", "stack", "Registry", "Op"]
+__all__ = ["dim", "knob", "no_capture", "multi_gpu", "meta", "stack", "Registry", "Op"]
 
 ROLES = ("ref", "problem", "check", "dims")
 _FIELD = re.compile(r"\{[^{}]*\}")
@@ -365,6 +371,32 @@ class no_capture(_Mark):
         return f"no_capture({self.reason!r})"
 
 
+class multi_gpu(_Mark):
+    """The solver runs on several GPUs at once: one process (a rank) per GPU, every rank
+    calling it with its own inputs (SPMD over ``torch.distributed``), e.g. an
+    expert-parallel MoE layer whose kernels exchange tokens between the GPUs. ``world``:
+    the number of GPUs (an int), or the name of the dim of ``<op>_problem`` that holds it
+    (``@multi_gpu("world")``: each problem says how many; ``op.world(problem)``). Every
+    solver of an op runs on the same GPUs. ``init()``: what a rank needs beyond
+    ``torch.distributed`` before its first call (e.g. MORI shmem), run once per rank of
+    the jobs the tools start (``kernelkit.spmd``); a program calling the op sets its
+    ranks up itself. ``@multi_gpu("world", init=mori_init)``."""
+
+    def __init__(self, world, init=None):
+        if isinstance(world, str):
+            if not world.isidentifier():
+                raise TypeError(f"multi_gpu: world {world!r}: not a dim name")
+        elif isinstance(world, bool) or not isinstance(world, int) or world < 2:
+            raise TypeError(f"multi_gpu: world {world!r}: the number of GPUs (an int >= 2) "
+                            "or the name of the dim holding it")
+        if init is not None and not callable(init):
+            raise TypeError(f"multi_gpu: init {init!r} is not callable")
+        self.world, self.init = world, init
+
+    def __repr__(self):
+        return f"multi_gpu({self.world!r})"
+
+
 class meta(_Mark):
     """Metadata for tools, read with ``Op.meta``: constants, or functions of dims and
     knobs. ``@meta(tile_m=64, cached=lambda bcm: bcm != 2)``."""
@@ -393,11 +425,15 @@ def _sig(op, role, f):
     return f"{op}_{role}{inspect.signature(f)}"
 
 
+def _gpus_text(w):
+    return f"the GPUs of dim {w!r}" if isinstance(w, str) else f"{w} GPU(s)"
+
+
 class _Solver:
     """A solver as its op sees it."""
 
-    __slots__ = ("name", "f", "params", "no_capture", "meta", "defaults", "knobs", "varkw",
-                 "regex")
+    __slots__ = ("name", "f", "params", "no_capture", "world", "init", "meta", "defaults",
+                 "knobs", "varkw", "regex")
 
     def __init__(self, op, name, f, ref_params, dims):
         where = f"{op}_{name}"
@@ -433,6 +469,13 @@ class _Solver:
         self.knobs = frozenset(knobs)
         caps = _marks(f, no_capture)
         self.no_capture = caps[0].reason if caps else None
+        gpus = _marks(f, multi_gpu)
+        if len(gpus) > 1:
+            raise TypeError(f"{where}: {len(gpus)} @multi_gpu marks; one gives its GPUs")
+        self.world, self.init = (gpus[0].world, gpus[0].init) if gpus else (1, None)
+        if isinstance(self.world, str) and self.world not in dims:
+            raise TypeError(f"{where}: @multi_gpu({self.world!r}): not a dim of {op}_problem "
+                            f"{list(dims)}")
         self.meta = {}
         for m in _marks(f, meta):
             self.meta.update(m.items)
@@ -550,6 +593,10 @@ class Op:
         if name in self._sol:
             raise TypeError(f"{self.name}_{name} is already registered")
         s = _Solver(self.name, name, f, self._ref_params, self.dim_names)
+        if self._sol and s.world != self._gpus():
+            raise TypeError(f"{self.name}_{name} runs on {_gpus_text(s.world)}, the solvers "
+                            f"{list(self._sol)} of {self.name} on {_gpus_text(self._gpus())}: "
+                            "every solver of an op runs on the same GPUs (@multi_gpu)")
         self._sol[name], self._fns[name] = s, f
         try:
             self._check_names(s)
@@ -564,6 +611,34 @@ class Op:
         raise AttributeError(f"Op is read-only ({k})")
 
     registry = property(lambda self: self._registry)
+
+    def _gpus(self):
+        """The solvers' GPUs: 1, the ``@multi_gpu`` number or its dim name."""
+        return next(iter(self._sol.values())).world if self._sol else 1
+
+    @property
+    def multi_gpu(self):
+        """Whether the solvers run on several GPUs at once (``@multi_gpu``): the tools run
+        such an op in a job of ranks (``kernelkit.spmd``)."""
+        return self._gpus() != 1
+
+    def world(self, problem=None):
+        """The GPUs (ranks) a call of ``problem`` runs on: 1 without ``@multi_gpu``, else its
+        number, or the value of its dim in ``problem`` (None there: the ``<op>_problem``
+        default)."""
+        w = self._gpus()
+        if not isinstance(w, str):
+            return w
+        v = (problem or {}).get(w)
+        v = self._defaults.get(w) if v is None else v
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError(f"{self.name}: a call runs on the number of GPUs in dim {w!r}; "
+                             f"the problem gives {v!r}")
+        return v
+
+    def _inits(self):
+        """The solvers' ``@multi_gpu`` init functions, each once, in registration order."""
+        return list(dict.fromkeys(s.init for s in self._sol.values() if s.init is not None))
 
     def __repr__(self):
         return f"Op({self.name!r}, solvers={list(self._fns)})"

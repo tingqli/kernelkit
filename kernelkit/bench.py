@@ -33,6 +33,10 @@ check: per bucket value, every variant vs ``<op>_ref``, vs the base, the worst o
 ``--repeats`` further calls vs the first, bit equality with the base (``--bitwise``) and
 CUDA-graph capture + replays vs eager (``--graph``; ``@no_capture`` solvers:
 n/a). ``--diff-tol``: the largest metric vs the base / repeat / graph that passes.
+
+An op whose solvers run on several GPUs (``@multi_gpu``): both commands start
+``op.world(problem)`` ranks (``kernelkit.spmd``); a check fails when it fails on any
+rank, a time is the slowest rank's, rank 0 prints and records.
 """
 
 import argparse
@@ -50,9 +54,11 @@ import sys
 
 import torch
 
+from . import spmd
 from .timing import MIN_COPIES, MIN_NOISE, NCOPIES, Timer, copies, interleaved
 from .timing import noise_band, verdict
-from .tune import _check, _inputs, resolve as resolve_tuning
+from .tune import _check, _inputs, ranked
+from .tune import resolve as resolve_tuning
 
 __all__ = ["Variant", "Resolved", "parse_variant", "resolve", "check_copies", "ab", "check",
            "run_meta", "meta_line", "Recorder", "md_table", "fmt", "main"]
@@ -230,23 +236,26 @@ def run_meta(tool, args=None, prog="python -m kernelkit", path=None):
         torch=torch.__version__, flydsl=flydsl_v,
         gpu=p.name, arch=p.gcnArchName.split(":")[0], cus=p.multi_processor_count,
         visible=os.environ.get("HIP_VISIBLE_DEVICES"), power_cap_w=power_cap(),
-        args=dict(vars(args)) if args is not None else {})
+        ranks=spmd.world(), args=dict(vars(args)) if args is not None else {})
 
 
 def meta_line(m):
     cap = f", cap {m['power_cap_w']:.0f} W" if m.get("power_cap_w") else ""
+    ranks = f" | {m['ranks']} ranks" if m.get("ranks", 1) > 1 else ""
     return (f"> {m['time']} | git {m['git']} | FlyDSL {m['flydsl']} | torch {m['torch']} | "
             f"{m['gpu']} ({m['arch']}, {m['cus']} CU{cap}) | HIP_VISIBLE_DEVICES "
-            f"{m['visible']}\n> `{m['cmd']}`")
+            f"{m['visible']}{ranks}\n> `{m['cmd']}`")
 
 
 class Recorder:
     """Prints text; with ``out``: also appends it to <out>/<name>.md and the measurement
-    records to <out>/<name>.jsonl (each run starts with a {"meta": ...} line)."""
+    records to <out>/<name>.jsonl (each run starts with a {"meta": ...} line). In a
+    multi-GPU job only rank 0 prints and records."""
 
     def __init__(self, out, name, meta):
         self.md = self.jl = None
-        if out:
+        self.on = spmd.rank() == 0
+        if out and self.on:
             os.makedirs(out, exist_ok=True)
             self.md = os.path.join(out, f"{name}.md")
             self.jl = os.path.join(out, f"{name}.jsonl")
@@ -255,6 +264,8 @@ class Recorder:
         self.text("\n" + meta_line(meta) + "\n")
 
     def text(self, s):
+        if not self.on:
+            return
         print(s, flush=True)
         if self.md:
             with open(self.md, "a") as f:
@@ -294,7 +305,8 @@ def _clone(out):
 
 
 def _same(a, b):
-    return bool(torch.equal(a, b)) if torch.is_tensor(a) else a == b
+    """Bit equality (in a multi-GPU job: on every rank)."""
+    return all(spmd.gather(bool(torch.equal(a, b)) if torch.is_tensor(a) else a == b))
 
 
 class _Inputs:
@@ -324,9 +336,10 @@ def _correctness(op, res, inputs, ref, bitwise):
     base, ok, notes, name = None, [], {}, None
     for r in res:
         try:
-            out = r.run(inputs)
+            out = spmd.first_call(lambda r=r: r.run(inputs), r.label)
             torch.cuda.synchronize()
         except Exception as ex:  # noqa: BLE001 - report the variant, keep the others
+            spmd.expect_agreed(ex)
             notes[r.label] = f"FAIL {type(ex).__name__}: {str(ex)[:200]}"
             continue
         c = None
@@ -506,7 +519,7 @@ def check(t, problem, points, specs, *, seed=7, repeats=5, graph=False, bitwise=
             cr = cb = jit = g = bw = None
             fails = []
             try:
-                out = fn()
+                out = spmd.first_call(fn, r.label)
                 torch.cuda.synchronize()
                 try:
                     m, cr = _metric(_check(op, out, expected, inp))
@@ -530,6 +543,7 @@ def check(t, problem, points, specs, *, seed=7, repeats=5, graph=False, bitwise=
                                          ("bitwise", bitwise and not bw)) if f]
                 ok = "OK" if not fails else "FAIL " + ",".join(dict.fromkeys(fails))
             except Exception as ex:  # noqa: BLE001
+                spmd.expect_agreed(ex)
                 ok = f"FAIL {type(ex).__name__}: {str(ex)[:160]}"
             bad += ok != "OK"
             rows.append([T, r.label, f"`{r.config}`", fmt(cr), fmt(cb), fmt(jit),
@@ -586,14 +600,18 @@ def parser(prog="python -m kernelkit"):
 
 
 def main(argv=None, prog="python -m kernelkit"):
+    argv = sys.argv[1:] if argv is None else list(argv)
     a = parser(prog).parse_args(argv)
     from . import _guess
 
     t = resolve_tuning(a.spec)
+    code, pids = ranked(argv, t, t.select([a.problem]), a.set)  # a multi-GPU op: in jobs
+    if code is not None:
+        return code
     pts = [_guess(v) for v in a.points]
     rec = Recorder(a.out, a.name or a.cmd, run_meta(a.cmd, a, prog))
     bad = 0
-    for pid in t.select([a.problem]):
+    for pid in pids:
         prob = t.problem(pid, a.set)
         desc = f"{t.op.name} problem {pid}: {({k: v for k, v in prob.items() if v is not None})}"
         if a.cmd == "ab":
@@ -604,4 +622,5 @@ def main(argv=None, prog="python -m kernelkit"):
             bad += check(t, prob, pts, a.variants, seed=a.seed, repeats=a.repeats,
                          graph=a.graph, bitwise=a.bitwise, diff_tol=a.diff_tol, rec=rec,
                          describe=desc)
+    spmd.finish()
     return 1 if bad else 0

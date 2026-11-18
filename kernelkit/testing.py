@@ -19,6 +19,9 @@ generates, for every problem (``op.problems(...)``: [(id, problem)]):
 Select with ``-k``, e.g. ``-k "tp8 and tiled"``. Items run problem by problem; the inputs
 and the reference result of the current problem are computed once and kept until the
 next.
+
+The items of an op whose solvers run on several GPUs (``@multi_gpu``) are skipped: a
+pytest process is one rank; ``python -m kernelkit check`` starts the ranks.
 """
 
 import inspect
@@ -47,6 +50,11 @@ def op_tests(op, problems, *, table=_DEFAULT):
     if op.problem is None:
         raise TypeError(f"{op.name}: op_tests needs {op.name}_problem (problem -> inputs)")
     path = op.registry.table if table is _DEFAULT else table
+    marks = ()
+    if op.multi_gpu:
+        marks = pytest.mark.skip(reason=f"{op.name} runs on several GPUs (@multi_gpu): "
+                                 "python -m kernelkit check <module>:<Tuning> <problem> -t "
+                                 "... -v ... starts its ranks")
     items = []
     for pid, prob in problems:
         missing = [n for n in op.dim_names if prob.get(n) is None and n not in op._defaults]
@@ -54,10 +62,11 @@ def op_tests(op, problems, *, table=_DEFAULT):
             raise TypeError(f"{op.name} problem {pid!r}: dims {missing} unset")
         pre = f"{op.name}-{pid}" if pid else op.name
         if op.dims is not None:
-            items.append(pytest.param(op, pid, prob, None, id=f"{pre}-dims"))
+            items.append(pytest.param(op, pid, prob, None, id=f"{pre}-dims", marks=marks))
         cfgs = op.tuned(prob, table=path) if path is not None else op.configs(prob)
         for cfg in cfgs:
-            items.append(pytest.param(op, pid, prob, cfg, id=f"{pre}-{op.name_of(cfg)}"))
+            items.append(pytest.param(op, pid, prob, cfg, id=f"{pre}-{op.name_of(cfg)}",
+                                      marks=marks))
     current = {}
 
     def prepared(op, pid, prob):

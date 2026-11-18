@@ -5,7 +5,8 @@
 - **测试**：一行 `op_tests(...)` 生成 pytest 测试；
 - **调优**：`python -m kernelkit tune ...` 在 GPU 上测每个配置，写出 CSV 调优表；
 - **分派**：`ops.axpy(x, y)` 按调优表选最快的配置运行；
-- **实验**：`python -m kernelkit ab / check ...` 按配置名做 A/B 计时和正确性检查。
+- **实验**：`python -m kernelkit ab / check ...` 按配置名做 A/B 计时和正确性检查；
+- **多卡**：一次调用跨好几张卡的 solver 加 `@multi_gpu(8)` 或 `@multi_gpu("world")`（卡数是 problem 的 dim），以上命令自动起相应个数的进程运行（第 8 节）。
 
 solver 用什么写都行（FlyDSL、Triton、HIP、torch……）。
 
@@ -18,21 +19,22 @@ solver 用什么写都行（FlyDSL、Triton、HIP、torch……）。
 5. [测试：op_tests](#5-测试op_tests)
 6. [调优：Tuning 与命令行](#6-调优tuning-与命令行)
 7. [A/B 计时与正确性检查](#7-ab-计时与正确性检查)
-8. [Python API 速查](#8-python-api-速查)
-9. [新增一个 op 的清单](#9-新增一个-op-的清单)
-10. [常见错误](#10-常见错误)
+8. [多卡 op：@multi_gpu](#8-多卡-opmulti_gpu)
+9. [Python API 速查](#9-python-api-速查)
+10. [新增一个 op 的清单](#10-新增一个-op-的清单)
+11. [常见错误](#11-常见错误)
 
 ## 1. 安装
 
 ```bash
-pip install "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0"
+pip install "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.2.0"
 ```
 
 在其他项目的 `pyproject.toml` 里依赖它：
 
 ```toml
 [project]
-dependencies = ["kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0"]
+dependencies = ["kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.2.0"]
 ```
 
 开发 kernelkit 本身：
@@ -48,6 +50,7 @@ python -m pytest kernelkit/tests      # CPU 测试，不需要 GPU
 | `kernelkit`（注册、分派、读表）、`kernelkit.table` | 只用标准库 |
 | `kernelkit.testing` | pytest（默认的结果检查用 torch） |
 | `kernelkit.timing`、`kernelkit.tune`、`kernelkit.bench`、`python -m kernelkit` | torch 和 GPU（ROCm 或 CUDA） |
+| `kernelkit.spmd`（多卡 op 的进程和同步，第 8 节） | torch.distributed；没有 GPU 时用 gloo 在 CPU 上运行（测试用） |
 
 kernelkit 不声明对 torch 的依赖，直接用环境里已经装好的 torch（不会替换掉 ROCm / CUDA 版的 torch）。
 
@@ -267,6 +270,8 @@ ops.axpy.pick(dict(n=3000, dtype="bf16"))                # {'solver': 'torch'}�
 
 @meta(tile_m=lambda bm: bm, cached_loads=False)            # 给工具读的元数据：常量，或 dim / knob 的函数
 @no_capture("passes a host counter")                       # 不能在 CUDA graph capture 中运行：capture 时分派跳过它
+@multi_gpu(8, init=mori_init)                              # 一次调用跨 8 张卡，每张卡一个进程（第 8 节）
+@multi_gpu("world")                                        # 卡数是 <op>_problem 的 dim world
 
 space = stack(knob("cfg", ("a", "b"), id="{}"), meta(cached_loads=False))   # 几个标记合成一个，多个 solver 共用
 ```
@@ -282,7 +287,7 @@ op_register = ops.register                         # 注册函数的模块都 im
 ```
 
 - 顺序：`<op>_ref` 最先；`<op>_problem` 在 solver 之前；嵌套的 op（`moe_dyn`）先注册 `moe_dyn_ref` 再注册它的 solver。
-- 违反约定时注册抛 `TypeError`（第 10 节），op 保持不变。
+- 违反约定时注册抛 `TypeError`（第 11 节），op 保持不变。
 - 读取：`ops.axpy` 或 `ops["axpy"]`；`Registry` 是 `{op 名: Op}` 的 Mapping。
 - `table=None`：没有调优表，`op(...)` 必须传 `config=`，测试跑全部配置。
 
@@ -365,7 +370,7 @@ test_axpy.py::test_axpy[axpy-n1000-bf16-tiled b1024]
 $ python -m pytest -q test_axpy.py -k "bf16 and tiled"
 ```
 
-每个没有默认值的 dim 都要在 problem 里给值。多个 op 就写多个测试函数。
+每个没有默认值的 dim 都要在 problem 里给值。多个 op 就写多个测试函数。跨卡的 op（第 8 节）生成的测试项都跳过（pytest 进程只是一个 rank），用 `python -m kernelkit check` 检查。
 
 ## 6. 调优：Tuning 与命令行
 
@@ -428,7 +433,7 @@ P 可以是 problem id 或组名（组里的每个 problem）。
 | `--iters` | 20 | 每次计时的调用数 |
 | `--rounds` | 3 | tune 的轮数：每轮新的输入，各配置交错计时，取中位数 |
 | `--copies` | 8 | `rotate` 输入的副本数 |
-| `--gpus` / `--per-job` | `0-7` / 4 | tune-all：用哪些卡、每个 problem 几张卡 |
+| `--gpus` / `--per-job` | `0-7` / 4 | tune-all：用哪些卡、每个 problem 几张卡（跨卡的 op：`op.world(problem)`） |
 | `--force` | | tune-all：跳过 GPU 空闲检查 |
 
 几个常用组合：
@@ -481,6 +486,7 @@ dtype=bf16 ~n=1000  old tiled b1024    6.0  new tiled b1024    6.0  old-cfg-now 
 
 - 先检查 GPU 是否空闲（rocm-smi，GFX 使用率 > 10% 就退出；`--force` 跳过），再拿每张卡的 `/tmp/gpu-<i>.lock`（被别的任务占着就退出）。
 - 每 `--per-job` 张卡一组，每组调一个 problem（组内第 g 张卡负责调优点的 `[g::per_job]`），空出来就接着做下一个。
+- 跨卡的 op（第 8 节）：每个 problem 占 `op.world(problem)` 张空闲的卡，这些卡上的 rank 一起调它的全部调优点；卡不够时等前面的 problem 结束。
 - 每个 problem 的输出和日志在 `DIR/<problem>_<g>.csv` / `.log`；最后合并成 `DIR/<表名>.new.csv`，确认后按提示 `cp` 覆盖旧表。
 
 ### 6.5 表文件
@@ -559,7 +565,132 @@ $ python -m kernelkit check axpy_tune:TUNING axpy-fp32 -t 1000 1000000 -v @table
 | `--repeats` / `--graph` | 5 / | check |
 | `--out DIR` / `--name` | / 命令名 | 结果追加到 `DIR/<name>.md` 和 `DIR/<name>.jsonl`（第一行是运行信息：命令、git 版本、torch 版本、GPU、功耗上限） |
 
-## 8. Python API 速查
+## 8. 多卡 op：@multi_gpu
+
+有的 op 一次调用要用好几张卡，例如 EP 的 MoE 整层：dispatch、专家计算、combine 在各卡之间交换 token。这样的 op 每张卡一个进程（rank），每个 rank 用自己的输入调用它。在 solver 上加 `@multi_gpu(...)` 声明它跨卡运行，参数是卡数，或者给出卡数的 dim 名。整层的不同做法（一个 kernel 做完整层，或者通信库的 dispatch / combine 加单卡的专家 kernel）是同一个 op 的不同 solver，一起调优：
+
+```python
+@op_register
+@dim("act", ("silu", "situv2"), id="{}")
+def moe_ep_problem(tokens, experts_global=256, world=8, act="silu", *, seed=0):   # world 是 dim：表的 key
+    experts = experts_global // world                                             # 每个 rank 的专家数由 dim 推出
+    ...
+
+@op_register
+@multi_gpu("world", init=mori_init)  # 卡数 = problem 的 dim world；init：kernelkit 起的每个 rank 在第一次调用前执行一次
+@knob("producers", (8, 16, 32), id="p{}")
+def moe_ep_mega(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None, producers=16):
+    ...  # 一个 persistent kernel 做完 dispatch、专家计算、combine
+
+@op_register
+@multi_gpu("world", init=mori_init)  # 一个 op 的 solver 写同样的 @multi_gpu
+@knob("cfg", ("s32", "l128"), id="{}")
+def moe_ep_mori(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None, cfg="l128"):
+    ...  # MORI dispatch -> 专家 kernel -> MORI combine
+```
+
+- `@multi_gpu(8)`：卡数固定。`@multi_gpu("world")`：卡数是 `<op>_problem` 的 dim `world`，它和其他 dim 一样进表的 key，`--set world=4` 就在 4 张卡上运行。`op.world(problem)` 给出一个 problem 用几张卡（单卡 op 是 1），`op.multi_gpu` 表示 op 是否跨卡。
+- 一个 op 的所有 solver 写同样的 `@multi_gpu`（不一致时注册报错）。
+- 命令不变：`tune`、`verify`、`ab`、`check` 发现 op 跨卡，就自动按多卡方式运行。kernelkit 起 `op.world(problem)` 个进程运行同一条命令（一条命令里的 problem 卡数不同时，按卡数分成几个任务依次运行），rank r 用可见的第 r 张卡（用 `HIP_VISIBLE_DEVICES` 选卡）；每个 rank 先建 `torch.distributed` 进程组（主机之间 gloo，GPU 之间 NCCL / RCCL），再执行 solver 的 `init`。`tune-all` 给每个 problem 它需要的卡数（6.4）。`problems`、`configs`、`show`、`merge`、`compare` 不运行 op，和单卡一样。
+- rank 0 的输出就是命令的输出；其他 rank 的输出写到临时目录里的 `rank<r>.log`，出错时打印出来。
+- 运行时的分派不变：程序自己起好各个 rank（例如 sglang 的 8 个进程），每个 rank 调用 `ops.<op>(...)`，各自查表。
+- `op_tests` 生成的测试项都跳过；用 `python -m kernelkit check` 检查。
+
+### 8.1 函数约定
+
+| 函数 | 每个 rank 上 | 约定 |
+|---|---|---|
+| `<op>_problem` | 用相同的 dim 和 seed 调用 | 返回本 rank 的输入（用 `torch.distributed.get_rank()` 区分）。卡数是 dim 时，它等于 `torch.distributed.get_world_size()` |
+| `<op>_ref` | 都调用 | 返回本 rank 的参考答案；可以用集合通信（例如收集所有 rank 的 token） |
+| `<op>_check` | 各自检查本 rank 的结果 | 不用集合通信；任一 rank 失败，这个配置在所有 rank 上都算 BAD；指标取各 rank 的最大值 |
+| `<op>_dims` | 各自读 | 各 rank 必须相同，否则会选到不同的配置；卡数是 dim 时也要返回它（例如从进程组或 op 自己的对象读）。本 rank 的输入里看不出来的量（例如所有 rank 的 token 总数）由调用方作为提示传入；`verify` 检查各 rank 是否一致，分桶值不在 `<op>_dims` 里时也作为提示传入 |
+| solver | 同时调用 | 跑不了时在所有 rank 上一起抛异常：只用各 rank 都知道的值（dim）判断，并且在第一个集合操作之前 |
+
+### 8.2 各 rank 步调一致
+
+所有 rank 必须以相同的顺序执行同样的集合操作。在结果可能因 rank 而异的地方，kernelkit 先汇总各 rank 的结果再统一决定：
+
+- **配置的第一次调用**：所有 rank 都返回，才算能跑；所有 rank 都抛异常，记为 n/a；只有部分 rank 抛异常时，整个任务停止（退出码 3），因为其他 rank 可能在集合操作里一直等下去。前提是其他 rank 的这次调用能返回：GPU kernel 的 launch 和 NCCL 集合操作都立即返回；在主机上阻塞的集合操作（gloo，或 synchronize 之后再读结果）会一直等到进程组超时。
+- **`<op>_check`**：汇总各 rank 的结果，任一失败就都失败。
+- **计时**：每次调用前先过主机 barrier，再让 GPU 空转（主机在这期间 launch），再过设备 barrier（1 个元素的 all-reduce），所有 rank 同时开始；每次调用取最慢 rank 的时间。各 rank 得到相同的时间，排出相同的顺序。
+- **写文件**：只有 rank 0 写表和报告。
+- 其他地方的异常（只发生在某个 rank 上，例如重复调用时）：该 rank 退出，kernelkit 停掉其他 rank，打印出错 rank 的日志。
+
+### 8.3 例子：allsum
+
+[examples/allsum](examples/allsum)：每个 rank 有自己的 `x`，`out` = 所有 rank 的 `x` 之和（all-reduce）。卡数是 problem 的 dim `world`。两个 solver：`rccl`（一次 `all_reduce`）和 `gather`（`all_gather` 后在本卡相加，分 `chunks` 段，段数要整除 `n`）。
+
+```python
+@op_register
+def allsum_ref(x):
+    """The interface (this rank's x) and this rank's answer (fp32); collectives are fine."""
+    parts = [torch.empty_like(x) for _ in range(dist.get_world_size())]
+    dist.all_gather(parts, x)
+    return torch.stack(parts).float().sum(0)
+
+
+@op_register
+def allsum_problem(n, world=2, *, seed=0):
+    """This rank's inputs (every rank gets the same dims and seed): n random bf16. world:
+    the ranks, one per GPU."""
+    g = torch.Generator(device="cuda").manual_seed(seed * world + dist.get_rank())
+    return dict(x=torch.randn(n, device="cuda", generator=g).to(torch.bfloat16))
+
+
+@op_register
+def allsum_dims(x):
+    """The same on every rank, so that every rank picks the same config."""
+    return dict(n=x.numel(), world=dist.get_world_size())
+
+# allsum_check: as for one GPU (no collectives)
+
+@op_register
+@multi_gpu("world")
+@no_capture(NO_GRAPH)
+def allsum_rccl(x):
+    out = x.clone()
+    dist.all_reduce(out)
+    return out
+```
+
+`allsum_tune.py` 在 2 张卡和 4 张卡上各调一组：`add_problem("allsum", n=(1001, 1 << 20, 1 << 24), world=[2, 4])`。
+
+```
+$ cd examples/allsum
+$ python -m kernelkit problems allsum_tune:TUNING
+allsum
+  allsum-world2 {'world': 2} n: 3 points 1001..16777216
+  allsum-world4 {'world': 4} n: 3 points 1001..16777216
+$ python -m kernelkit tune allsum_tune:TUNING allsum          # 命令和单卡一样；按卡数起两个任务
+[kernelkit] allsum runs on 2 GPUs here (@multi_gpu): 2 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_68f74o3o/rank<r>.log
+[11:05:06] allsum allsum-world2 {'world': 2}: 3 configs, 8 copies of ['x']
+[11:05:07] n   1001: rccl 27.2 | gather c1 30.0  (1 n/a: AssertionError)
+[11:05:07] n 1048576: rccl 76.1 | gather c1 84.3 | gather c4 191.8
+[11:05:08] n 16777216: rccl 766.2 | gather c1 860.3 | gather c4 966.5
+[kernelkit] allsum runs on 4 GPUs here (@multi_gpu): 4 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_hpr0wvvt/rank<r>.log
+[11:05:24] allsum allsum-world4 {'world': 4}: 3 configs, 8 copies of ['x']
+[11:05:25] n   1001: rccl 34.0 | gather c1 39.0  (1 n/a: AssertionError)
+[11:05:25] n 1048576: rccl 63.9 | gather c1 100.5 | gather c4 232.6
+[11:05:26] n 16777216: rccl 419.6 | gather c1 963.5 | gather c4 1099.6
+$ head -3 allsum_tuned.csv                                      # world 是 key
+world,~n,config,us,err
+2,1001,rccl,27.2,3.6e-03
+2,1001,gather c1,30.0,3.6e-03
+$ python -m kernelkit check allsum_tune:TUNING allsum-world4 -t 1001 1048576 -v @table "gather c4"
+...
+| n | variant | config | err ref | err base | repeat | bitwise | graph | result |
+|---:|---|---|---:|---:|---:|---|---|---|
+| 1001 | @table | `rccl` | 4.4e-03 | 0 | 0 | - | - | OK |
+| 1001 | gather c4 | `gather c4` | - | - | - | - | - | FAIL AssertionError: n=1001 % 4 chunks |
+| 1048576 | @table | `rccl` | 4.6e-03 | 0 | 0 | - | - | OK |
+| 1048576 | gather c4 | `gather c4` | 3.1e-03 | 6.1e-03 | 0 | - | - | OK |
+
+1 FAILED
+```
+
+`gather c4` 在 n=1001 时所有 rank 都抛异常（段数不整除 n）：tune 记为 n/a，check 记为 FAIL，任务继续。时间是最慢 rank 的。
+
+## 9. Python API 速查
 
 ```python
 # 表文件（标准库）
@@ -592,11 +723,17 @@ from kernelkit import bench as kb
 kb.ab(t, prob, [4096], ["@table", "tiled b16384"], rounds=5, iters=16)
 bad = kb.check(t, prob, [1000], ["@table", "tiled b1024"], graph=True)
 rec = kb.Recorder(out_dir, "ab", kb.run_meta("ab", prog="python -m mypkg.bench", path=pkg_dir))
+
+# 多卡 op（torch.distributed）
+op.multi_gpu; op.world(problem)                 # 是否跨卡；一个 problem 用几张卡（单卡 op 是 1）
+from kernelkit import spmd
+spmd.rank(), spmd.world()                       # 本进程在 kernelkit 起的任务里的 rank、rank 数（任务外：0、1）
+spmd.gather(obj)                                # 各 rank 的 obj，按 rank 排列（任务外：[obj]）
 ```
 
 `kb.ab` / `kb.check` 的钩子：`inputs(value, seed) -> 接口参数 dict`（替换 `<op>_problem`）、`annotate(inputs, resolved) -> (标题后缀, 记录字段)`（ab）、`alias(base) -> 配置名`（变体的简写）、`unit`（标题里分桶值的单位名）、`describe`（开头打印的说明）。
 
-## 9. 新增一个 op 的清单
+## 10. 新增一个 op 的清单
 
 1. 建一个注册表模块：`ops = Registry("<包名>", table=<包目录>/configs/<op>_tuned.csv)`，`op_register = ops.register`。
 2. 按顺序写函数，每个都加 `@op_register`（最外层）：
@@ -609,8 +746,9 @@ rec = kb.Recorder(out_dir, "ab", kb.run_meta("ab", prog="python -m mypkg.bench",
 4. 写测试：`test_<op> = op_tests(ops.<op>, ops.<op>.problems(...))`。
 5. 运行：`python -m kernelkit configs ...` 看配置 → `tune`（或多卡 `tune-all` + `compare` + `cp`）→ `show` / `verify` → `pytest`。
 6. 调用方直接 `ops.<op>(...)`；没调优过的 key 会报错，补 `add_problem` 后重新调优。
+7. 一次调用跨好几张卡的 op：每个 solver 加同样的 `@multi_gpu(卡数或 dim 名)`（rank 需要额外初始化时带 `init=`），problem / ref / check / dims 按 8.1 写。
 
-## 10. 常见错误
+## 11. 常见错误
 
 | 报错 | 处理 |
 |---|---|
@@ -640,3 +778,10 @@ rec = kb.Recorder(out_dir, "ab", kb.run_meta("ab", prog="python -m mypkg.bench",
 | `variants [...] may read the rotated inputs with cached loads` | 用 `--copies` ≥ 8；solver 确实不走 cache 读时加 `@meta(cached_loads=False)` |
 | `GPUs busy (GFX use %)` / `GPU g is locked by another job` | 卡被占用：等一下或换 `--gpus`（`--force` 只跳过空闲检查，不跳过锁） |
 | 两个调优点之间的调用失败 | 分桶维上的下限型限制（例如要求 `n >= block`）在点之间可能不满足：在 solver 内处理，或把这个 dim 作为 key |
+| `f_k runs on 1 GPU(s), the solvers [...] of f on 8 GPU(s): every solver of an op runs on the same GPUs` | 给 op 的每个 solver 加同样的 `@multi_gpu` |
+| `@multi_gpu('world'): not a dim of f_problem` | 卡数用 dim 名时，`<op>_problem` 要有这个参数，并且先注册 |
+| `f runs on 8 GPUs here (@multi_gpu); 2 visible` | 让至少这么多张卡可见（`HIP_VISIBLE_DEVICES`） |
+| `problems {...} run on more GPUs than --gpus` | tune-all 的 `--gpus` 给够卡 |
+| `... raised on rank(s) [3] only ...; stopping the job`（退出码 3） | solver 只用各 rank 都有的值（dim）判断能不能跑，并在第一个集合操作之前抛异常 |
+| `... (outside an agreed step: ...); stopping the job` | 只在某个 rank 上出现的异常（例如重复调用、CUDA graph capture 时）：看打印的 traceback 和该 rank 的日志 |
+| `BAD <op>_dims differ between the ranks` | `<op>_dims` 只返回各 rank 相同的值，其余由调用方作为提示传入 |

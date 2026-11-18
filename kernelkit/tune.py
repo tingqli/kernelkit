@@ -21,6 +21,11 @@ inputs (``<op>_problem``, seed 101 * point + round); per round every config runs
 (``<op>_check``: a failure is BAD) and timed cold (``kernelkit.timing.time_cold``, the
 ``rotate`` inputs cycling through ``--copies`` copies), the configs interleaved. Every
 config that ran and passed is stored: the median time, the worst metric of the check.
+
+An op whose solvers run on several GPUs (``@multi_gpu``): ``tune`` and ``verify`` start
+``op.world(problem)`` ranks of the command (``kernelkit.spmd``; one job per number of
+GPUs), each runs its rank's share of the problem, the times are the slowest rank's,
+rank 0 writes the table; ``tune-all`` gives each problem that many GPUs.
 """
 
 import argparse
@@ -37,11 +42,12 @@ import time
 
 import torch
 
-from . import _cell, _guess, _unknown
+from . import _cell, _guess, _unknown, spmd
 from . import table as _table
 from .timing import NCOPIES, copies, time_cold
 
-__all__ = ["Tuning", "resolve", "tune", "show", "verify", "merge", "tune_all", "main"]
+__all__ = ["Tuning", "resolve", "tune", "show", "verify", "merge", "worlds", "ranked",
+           "tune_all", "main"]
 
 _DEFAULT = object()  # table=: the registry's
 
@@ -229,13 +235,18 @@ def resolve(spec):
 
 
 def _check(op, out, expected, inputs):
-    """``<op>_check`` (default: torch.testing.assert_close) -> its metrics dict."""
-    if op.check is not None:
-        return op.check(out, expected, **inputs) or {}
-    if torch.is_tensor(out) and torch.is_tensor(expected):
-        expected = expected.to(out.dtype)
-    torch.testing.assert_close(out, expected)
-    return {}
+    """``<op>_check`` (default: torch.testing.assert_close) -> its metrics dict; in a
+    multi-GPU job agreed between the ranks (``kernelkit.spmd.check``)."""
+    def local():
+        if op.check is not None:
+            return op.check(out, expected, **inputs) or {}
+        exp = expected
+        if torch.is_tensor(out) and torch.is_tensor(expected):
+            exp = expected.to(out.dtype)
+        torch.testing.assert_close(out, exp)
+        return {}
+
+    return spmd.check(local)
 
 
 class _Rotation:
@@ -284,7 +295,7 @@ def tune(t, problem, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=pr
                     continue
                 run = lambda over, cfg=cfg: op.run(cfg, **{**inputs, **over})  # noqa: E731
                 try:
-                    res = run({})
+                    res = spmd.first_call(lambda: run({}), name)
                 except Exception as ex:  # noqa: BLE001 - the solver cannot run it
                     na[name] = type(ex).__name__
                     continue
@@ -304,7 +315,7 @@ def tune(t, problem, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=pr
             rows.append(dict({k: prob[k] for k in t.keys}, **{t.column: p}, config=name,
                              us=f"{us:.1f}", **{k: f"{v:.1e}" for k, v in metrics[name].items()}))
         rows.sort(key=lambda r: float(r["us"]))
-        if rows:
+        if rows and spmd.rank() == 0:
             _table.merge(out, rows, t.fields([k for k in rows[0] if k not in
                                               (*t.keys, t.column, "config", "us")]))
         top = " | ".join(f"{r['config']} {r['us']}" for r in rows[:3])
@@ -349,7 +360,9 @@ def show(t, problem, path=None, out=print):
 
 def verify(t, problem, points, path=None, *, iters=20, ncopies=NCOPIES, log=print):
     """``op(...)`` (the table's pick) at each bucket value, also between tuned points:
-    the check against ``<op>_ref`` and the time vs the table entry."""
+    the check against ``<op>_ref`` and the time vs the table entry. A bucket value that
+    ``<op>_dims`` does not read from the inputs is passed as a hint, as a caller would.
+    In a multi-GPU job the ranks' ``<op>_dims`` must agree (each rank picks by its own)."""
     op, b, path = t.op, t.bucket, path or t.table
     pts = dict(_points(op, problem, path))
     rot = _Rotation(t.rotate, ncopies)
@@ -360,9 +373,17 @@ def verify(t, problem, points, path=None, *, iters=20, ncopies=NCOPIES, log=prin
         expected = op.ref(**inputs)
         cfg = op.pick(prob, table=path)
         hints = {k: prob[k] for k in t.keys if k not in op._ref_names}
+        got = op.dims(**inputs) if op.dims is not None else {}
+        if b not in got:
+            hints[b] = v
+        ranks = spmd.gather(got)
+        if any(d != ranks[0] for d in ranks):
+            log(f"{b} {v:6}: BAD {op.name}_dims differ between the ranks, so they would pick "
+                f"different configs: {ranks}")
+            continue
         fn = lambda over: op(**{**inputs, **over}, table=path, **hints)  # noqa: E731
         try:
-            m = _check(op, fn({}), expected, inputs)
+            m = _check(op, spmd.first_call(lambda: fn({}), op.name_of(cfg)), expected, inputs)
             msg = "".join(f" | {k} {x:.1e}" for k, x in m.items())
         except AssertionError as ex:
             msg = f" | BAD {ex}"
@@ -382,6 +403,30 @@ def merge(parts, path, log=print):
         rows += rs
     _table.merge(path, rows, head)
     log(f"merged {len(rows)} rows from {len(parts)} files into {path}")
+
+
+def worlds(t, pids, sets=()):
+    """{number of GPUs: [problem id, ...]} of the problems ``pids`` (``--set`` ``sets``) of a
+    multi-GPU op (``op.world(problem)``), in order."""
+    out = {}
+    for pid in pids:
+        out.setdefault(t.op.world(t.problem(pid, sets)), []).append(pid)
+    return out
+
+
+def ranked(argv, t, pids, sets=()):
+    """Where a command on the problems ``pids`` runs. A multi-GPU op, in the launcher: one
+    job per number of GPUs, each running ``argv`` (``kernelkit.spmd.launch``) -> (exit code,
+    None); in a rank: join its job -> (None, the problems of the job). Else (None, pids)."""
+    if not t.op.multi_gpu:
+        return None, pids
+    jobs = worlds(t, pids, sets)
+    if spmd.child() is None:
+        codes = [spmd.launch(argv, t.op, n) for n in jobs]
+        return next((c for c in codes if c), 0), None
+    n = spmd.child()[1]
+    spmd.init(t.op, n)
+    return None, jobs.get(n, [])
 
 
 # ---- several GPUs --------------------------------------------------------------------
@@ -429,14 +474,20 @@ def lock_gpus(gpus):
 def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=20,
              ncopies=NCOPIES, sets=(), force=False, log=print):
     """Every problem of ``pids`` on ``per_job`` GPUs (GPU g of the group takes
-    points[g::per_job]; ``points`` None: each problem's own); groups of ``gpus`` take the
-    next problem when they free up. Then the BAD lines of all logs and a merged
-    <out_dir>/<table name>.new.csv."""
-    if len(gpus) < per_job:
+    points[g::per_job]; ``points`` None: each problem's own); the next problem starts when
+    enough GPUs of ``gpus`` are free. An op on several GPUs (``@multi_gpu``): a problem
+    takes ``op.world(problem)`` GPUs for one job of that many ranks over all its points.
+    Then the BAD lines of all logs and a merged <out_dir>/<table name>.new.csv."""
+    multi = t.op.multi_gpu
+    if not multi and len(gpus) < per_job:
         raise SystemExit(f"--per-job {per_job} needs at least that many --gpus ({gpus})")
     for pid in pids:
         if pid not in t.problems:
             raise SystemExit(f"problem {pid!r}: one of {list(t.problems)}")
+    need = {pid: t.op.world(t.problem(pid, sets)) if multi else per_job for pid in pids}
+    big = {pid: n for pid, n in need.items() if n > len(gpus)}
+    if big:
+        raise SystemExit(f"problems {big} run on more GPUs than --gpus {gpus}")
     if not force:
         busy = busy_gpus(gpus)
         if busy:
@@ -444,23 +495,26 @@ def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=2
                              "skews the table. Wait, pick other --gpus, or --force")
     held = lock_gpus(gpus)  # noqa: F841 - released at exit
     os.makedirs(out_dir, exist_ok=True)
-    groups = [gpus[i:i + per_job] for i in range(0, len(gpus) - per_job + 1, per_job)]
     env = dict(os.environ, AITER_LOG_LEVEL=os.environ.get("AITER_LOG_LEVEL", "ERROR"))
-    todo, running, failed = list(pids), {}, []
+    free, todo, running, failed = list(gpus), list(pids), [], []
     t0 = time.time()
     while todo or running:
-        for gi, procs in list(running.items()):
+        for job in list(running):
+            grp, procs = job
             if all(p.poll() is not None for _, p in procs):
                 failed += [name for name, p in procs if p.returncode]
-                del running[gi]
-        for gi, grp in enumerate(groups):
-            if gi in running or not todo:
-                continue
+                running.remove(job)
+                free = sorted(free + grp, key=gpus.index)
+        while todo and need[todo[0]] <= len(free):
             pid = todo.pop(0)
+            grp, free = free[:need[pid]], free[need[pid]:]
             pts = list(points or t.points[pid])
+            # (index, its points, its HIP_VISIBLE_DEVICES): one job of len(grp) ranks, or
+            # one process per GPU
+            jobs = ([(0, pts, ",".join(map(str, grp)))] if multi else
+                    [(g, pts[g::per_job], str(gpu)) for g, gpu in enumerate(grp)])
             procs = []
-            for g, gpu in enumerate(grp):
-                shard = pts[g::per_job]
+            for g, shard, visible in jobs:
                 if not shard:
                     continue
                 stem = os.path.join(out_dir, f"{pid}_{g}")
@@ -472,9 +526,10 @@ def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=2
                 with open(stem + ".log", "w") as fh:
                     procs.append((stem + ".log", subprocess.Popen(
                         cmd, stdout=fh, stderr=subprocess.STDOUT,
-                        env=dict(env, HIP_VISIBLE_DEVICES=str(gpu)))))
-            running[gi] = procs
-            log(f"{pid}: GPUs {grp}, {len(pts)} points")
+                        env=dict(env, HIP_VISIBLE_DEVICES=visible))))
+            running.append((grp, procs))
+            log(f"{pid}: GPUs {grp}, {len(pts)} points" + (" (one job of its ranks)"
+                                                            if multi else ""))
         time.sleep(2)
     log(f"all jobs done in {(time.time() - t0) / 60:.1f} min")
     logs = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.log")))
@@ -518,12 +573,14 @@ def parser(prog="python -m kernelkit"):
     p.add_argument("--copies", type=int, default=NCOPIES,
                    help="copies of the rotate inputs the timed calls cycle through")
     p.add_argument("--gpus", default="0-7", help="tune-all: GPUs, e.g. 0-7 or 0,1,2,3")
-    p.add_argument("--per-job", type=int, default=4, help="tune-all: GPUs per problem")
+    p.add_argument("--per-job", type=int, default=4,
+                   help="tune-all: GPUs per problem (an op on several GPUs: op.world(problem))")
     p.add_argument("--force", action="store_true", help="tune-all: skip the idle-GPU check")
     return p
 
 
 def main(argv=None, prog="python -m kernelkit"):
+    argv = sys.argv[1:] if argv is None else list(argv)
     a = parser(prog).parse_args(argv)
     if a.cmd == "compare":
         if len(a.args) != 1:
@@ -553,6 +610,10 @@ def main(argv=None, prog="python -m kernelkit"):
         raise SystemExit(f"{a.cmd}: problems or groups; groups: {list(t.groups)}; problems: "
                          f"{list(t.problems)}")
     pids = t.select(a.args)
+    if a.cmd in ("tune", "verify"):  # a multi-GPU op: in jobs of ranks
+        code, pids = ranked(argv, t, pids, a.set)
+        if code is not None:
+            return code
     for pid in pids:
         prob = t.problem(pid, a.set)
         if a.cmd == "configs":
@@ -570,4 +631,5 @@ def main(argv=None, prog="python -m kernelkit"):
         else:
             verify(t, prob, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path,
                    iters=a.iters, ncopies=a.copies, log=log)
+    spmd.finish()
     return 0

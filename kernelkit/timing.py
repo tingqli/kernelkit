@@ -16,11 +16,17 @@ the next of >= MIN_COPIES input copies. There is no other way to time: inputs th
 call re-reads stay in the 256 MB MALL, which no flush evicts, and cached loads of them
 looked 5-13% faster than they are (a write flush instead leaves dirty lines: 9-48%
 slower); timing without a flush depends on what the previous call left in the caches.
+
+In a multi-GPU job (``kernelkit.spmd``) a timed call starts on every rank together (a
+host barrier before the GPU sleep, a device barrier after it) and its time is the
+slowest rank's: every rank gets the same times.
 """
 
 import statistics
 
 import torch
+
+from . import spmd
 
 __all__ = ["NCOPIES", "MIN_COPIES", "MIN_NOISE", "flush_cache", "copies", "time_cold",
            "Timer", "interleaved", "noise_band", "verdict"]
@@ -56,21 +62,27 @@ def copies(x, n=NCOPIES):
 def _times(fn, iters, warmup):
     """GPU times (us) of ``iters`` cold calls of ``fn()``: L2 flush, then a GPU sleep
     that lets the host enqueue all of fn's launches before the start event, so host
-    overhead is excluded (as in a CUDA graph replay)."""
+    overhead is excluded (as in a CUDA graph replay). In a multi-GPU job: the slowest
+    rank's time of each call, all ranks starting it together."""
+    multi = spmd.world() > 1
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     ts = []
     for _ in range(iters):
         flush_cache()
+        if multi:
+            spmd.barrier()  # every host is here, then enqueues the sleep and the call
         torch.cuda._sleep(2_000_000)  # ~1 ms of GPU spin
+        if multi:
+            spmd.align()  # every GPU starts the call together
         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         e0.record()
         fn()
         e1.record()
         torch.cuda.synchronize()
         ts.append(e0.elapsed_time(e1) * 1e3)
-    return ts
+    return spmd.slowest(ts)
 
 
 def time_cold(fn, iters=20, warmup=3):

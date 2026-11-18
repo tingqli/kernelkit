@@ -1,14 +1,16 @@
 """CPU tests of kernelkit (no GPU): registration, grids, config names, dispatch, the
-checks a registration runs on the conventions, and the pytest tests ``kernelkit.testing``
-generates."""
+checks a registration runs on the conventions, the pytest tests ``kernelkit.testing``
+generates, and multi-GPU jobs (their ranks on the CPU over gloo)."""
 
 import os
+import subprocess
+import sys
 import textwrap
 
 import pytest
 
 import kernelkit as kit
-from kernelkit import Registry, dim, knob, meta, no_capture, stack
+from kernelkit import Registry, dim, knob, meta, multi_gpu, no_capture, stack
 from kernelkit.testing import assert_close
 
 pytest_plugins = ["pytester"]
@@ -108,7 +110,8 @@ def _ops(src, **registry):
         out.append(line)
     reg = Registry(**registry)
     exec("\n".join(out), {"op_register": reg.register, "dim": dim, "knob": knob,
-                          "no_capture": no_capture, "meta": meta, "stack": stack}, {})
+                          "no_capture": no_capture, "multi_gpu": multi_gpu, "meta": meta,
+                          "stack": stack}, {})
     return reg
 
 
@@ -724,3 +727,279 @@ def test_toy_runs_without_pytest_helpers(toy):
                     op.run(cfg, **inputs)
                 continue
             assert op.check(op.run(cfg, **inputs), expected, **inputs)["err"] < 1e-12
+
+
+# ---- multi-GPU ops ---------------------------------------------------------------------
+
+def test_multi_gpu_marks():
+    from kernelkit import spmd
+
+    for bad in (1, 0, True, 2.0):
+        with pytest.raises(TypeError, match="an int >= 2"):
+            multi_gpu(bad)
+    with pytest.raises(TypeError, match="not a dim name"):
+        multi_gpu("8")
+    with pytest.raises(TypeError, match="not callable"):
+        multi_gpu(2, init=5)
+    assert repr(multi_gpu(8)) == "multi_gpu(8)" and repr(multi_gpu("w")) == "multi_gpu('w')"
+    ref = "def f_ref(x, *, a=1): pass\n"
+    _raises(ref + "@multi_gpu(2)\ndef f_problem(n=1): pass", "only @dim marks")
+    _raises("@multi_gpu(2)\ndef f_ref(x): pass", "only solvers")
+    _raises(ref + "@multi_gpu(2)\n@multi_gpu(2)\ndef f_k(x, *, a=1): pass", "2 @multi_gpu marks")
+    _raises(ref + "@multi_gpu(2)\ndef f_k(x, *, a=1): pass\ndef f_j(x, *, a=1): pass",
+            r"f_j runs on 1 GPU\(s\), the solvers \['k'\] of f on 2 GPU\(s\)")
+    _raises(ref + "def f_k(x, *, a=1): pass\n@multi_gpu(4)\ndef f_j(x, *, a=1): pass",
+            "every solver of an op runs on the same GPUs")
+    _raises(ref + "def f_problem(n, w=2): pass\n@multi_gpu(2)\ndef f_k(x, *, a=1): pass\n"
+            "@multi_gpu('w')\ndef f_j(x, *, a=1): pass", r"f_j runs on the GPUs of dim 'w'")
+    _raises(ref + "def f_problem(n): pass\n@multi_gpu('w')\ndef f_k(x, *, a=1): pass",
+            r"@multi_gpu\('w'\): not a dim of f_problem \['n'\]")
+    one = _ops(ref + "def f_k(x, *, a=1): pass").f
+    assert (one.multi_gpu, one.world(), _ops(ref).f.world()) == (False, 1, 1)
+    # the number of GPUs from a dim: the problem's value, else the <op>_problem default
+    f = _ops(ref + "def f_problem(n, w=4): pass\n@multi_gpu('w')\ndef f_k(x, *, a=1): pass").f
+    assert f.multi_gpu and f.world(dict(n=1, w=None)) == 4 and f.world(dict(n=1, w=8)) == 8
+    assert f.world() == 4
+    with pytest.raises(ValueError, match="dim 'w'; the problem gives 0"):
+        f.world(dict(n=1, w=0))
+
+    reg = Registry()
+
+    def one():
+        pass
+
+    def two():
+        pass
+
+    @reg.register
+    def g_ref(x):
+        pass
+
+    for name, init in (("a", one), ("b", one), ("c", two), ("d", None)):
+        reg.register(_named(multi_gpu(8, init=init), f"g_{name}"))
+    with pytest.raises(TypeError, match=r"g_e runs on 4 GPU\(s\), the solvers"):
+        reg.register(_named(multi_gpu(4), "g_e"))
+    assert list(reg.g.solvers) == ["a", "b", "c", "d"] and reg.g.world() == 8
+    assert reg.g.multi_gpu and reg.g._inits() == [one, two]
+    # outside a job: one rank, every helper is the plain operation
+    assert (spmd.rank(), spmd.world(), spmd.child()) == (0, 1, None)
+    assert spmd.first_call(lambda: 5, "x") == 5 and spmd.check(lambda: {"e": 1}) == {"e": 1}
+    assert spmd.gather(3) == [3] and spmd.slowest([2.0, 1.0]) == [2.0, 1.0]
+    with pytest.raises(AssertionError, match="no"):
+        spmd.check(lambda: (_ for _ in ()).throw(AssertionError("no")))
+    spmd.expect_agreed(ValueError("one process: nothing to stop"))
+    spmd.finish()  # not in a job: nothing
+
+
+def _named(mark, name):
+    def f(x):
+        return x
+
+    f.__name__ = name
+    return mark(f)
+
+
+SPMD_TOY = '''
+import os
+
+import torch
+import torch.distributed as dist
+
+from kernelkit import Registry, knob, multi_gpu, spmd
+from kernelkit import tune as kt
+
+ops = Registry(table=os.environ["TOY_TABLE"])
+op_register = ops.register
+JOINED = []
+
+
+def join():
+    JOINED.append(dist.get_rank())
+
+
+@op_register
+def tsum_ref(x):
+    """The sum over the ranks of every rank's x (a collective in the reference)."""
+    out = torch.tensor(x, dtype=torch.float64)
+    dist.all_reduce(out)
+    return out
+
+
+@op_register
+def tsum_problem(n, world=2, *, seed=0):
+    """This rank's x; world: the ranks."""
+    assert world == dist.get_world_size(), (world, dist.get_world_size())
+    return dict(x=[float(dist.get_rank() * 100 + i + seed) for i in range(n)])
+
+
+@op_register
+def tsum_dims(x):
+    return dict(n=len(x), world=dist.get_world_size())
+
+
+@op_register
+def tsum_check(out, expected, **inputs):
+    err = float((out - expected).abs().max())
+    assert err == 0, f"err {err}"
+    return {"err": float(spmd.rank())}  # the table gets the worst rank's
+
+
+@op_register
+@multi_gpu("world", init=join)
+@knob("k", (1, 2), id="k{}")
+def tsum_add(x, *, k=1):
+    assert JOINED == [dist.get_rank()], JOINED  # init ran once, before the first call
+    assert len(x) % k == 0, f"n={len(x)} % {k}"  # on every rank: n/a
+    out = torch.tensor(x, dtype=torch.float64)
+    dist.all_reduce(out)
+    return out
+
+
+@op_register
+@multi_gpu("world", init=join)
+def tsum_off(x):
+    """Wrong on ranks >= 1: BAD on every rank."""
+    out = torch.tensor(x, dtype=torch.float64)
+    dist.all_reduce(out)
+    return out + spmd.rank()
+
+
+@op_register
+@multi_gpu("world")
+def tsum_odd(x):
+    """Raises on rank 1 only when TOY_ODD is set: the job stops. No collective: rank 0
+    must reach the agreement (a host-blocking collective would wait for rank 1 instead;
+    on a GPU the launches return at once). It knows the inputs: x[i] = 100 rank + c_i."""
+    assert not (os.environ.get("TOY_ODD") and spmd.rank() == 1), "rank 1 cannot"
+    w = spmd.world()
+    return torch.tensor([50.0 * w * (w - 1) + w * (v - 100 * spmd.rank()) for v in x],
+                        dtype=torch.float64)
+
+
+def _time(fn, iters=20):
+    """No GPU: rank r takes 1 + r us per call; the slowest rank's time is kept."""
+    fn()
+    return spmd.slowest([1.0 + spmd.rank()] * iters)[0]
+
+
+kt.time_cold = _time
+TUNING = (kt.Tuning(ops.tsum).set_bucket("n").add_problem("t", n=(3, 4))
+          .add_problem("t3", n=4, world=3))
+'''
+
+
+def _kit(tmp_path, *args, **env):
+    """``python -m kernelkit <args>`` on the CPU (no GPU visible) in ``tmp_path``."""
+    pytest.importorskip("torch.distributed")
+    env = dict(os.environ, HIP_VISIBLE_DEVICES="-1", CUDA_VISIBLE_DEVICES="",
+               TOY_TABLE=str(tmp_path / "tuned.csv"), **env)
+    env.pop("KERNELKIT_RANK", None)
+    return subprocess.run([sys.executable, "-m", "kernelkit", *args], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=600)
+
+
+def test_multi_gpu_job(tmp_path):
+    from kernelkit import spmd, table
+
+    (tmp_path / "kit_toy_spmd.py").write_text(SPMD_TOY)
+    # problems on 2 (t) and on 3 ranks (t3): one job each
+    res = _kit(tmp_path, "tune", "kit_toy_spmd:TUNING", "t", "t3")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "tsum runs on 2 GPUs here (@multi_gpu): 2 ranks" in out
+    assert "tsum runs on 3 GPUs here (@multi_gpu): 3 ranks" in out
+    # n/a on every rank (k2 at n=3), BAD on ranks >= 1 (off): out on every rank
+    assert "n      3: add k1 2.0 | odd 2.0  [off: BAD rank 1: err 1.0]  (1 n/a: " \
+           "AssertionError)" in out, out
+    fields, rows = table.read(str(tmp_path / "tuned.csv"))  # rank 0 wrote it
+    assert fields == ("world", "~n", "config", "us", "err")
+    assert [(r["world"], r["~n"], r["config"], r["us"], r["err"]) for r in rows] == [
+        ("2", "3", "add k1", "2.0", "1.0e+00"), ("2", "3", "odd", "2.0", "1.0e+00"),
+        ("2", "4", "add k1", "2.0", "1.0e+00"), ("2", "4", "add k2", "2.0", "1.0e+00"),
+        ("2", "4", "odd", "2.0", "1.0e+00"),
+        ("3", "4", "add k1", "3.0", "2.0e+00"), ("3", "4", "add k2", "3.0", "2.0e+00"),
+        ("3", "4", "odd", "3.0", "2.0e+00")]  # the slowest rank's time, the worst rank's err
+    res = _kit(tmp_path, "verify", "kit_toy_spmd:TUNING", "t", "-t", "2", "4")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "n      4 -> point      4: add k1" in res.stdout and "err 1.0e+00" in res.stdout
+    # raising on some ranks only: the job stops, nothing is written
+    res = _kit(tmp_path, "tune", "kit_toy_spmd:TUNING", "t", "-t", "4", "--out", "odd.csv",
+               TOY_ODD="1")
+    out = res.stdout + res.stderr
+    assert res.returncode == spmd.ABORT, out
+    assert "odd raised on rank(s) [1] only (AssertionError: rank 1 cannot)" in out, out
+    assert not (tmp_path / "odd.csv").exists()
+
+
+def test_tune_all_multi_gpu(tmp_path, monkeypatch):
+    from kernelkit import tune as kt
+
+    op = _ops("def f_ref(x): pass\ndef f_problem(n, w=2): pass\n"
+              "@multi_gpu('w')\ndef f_k(x): pass").f
+    t = (kt.Tuning(op).set_bucket("n").add_problem("p", n=(1, 2, 3), w=[2, 3, 4])
+         .add_problem("q", n=1, w=9))
+    jobs, rounds = [], []
+
+    class Popen:
+        returncode = 0
+
+        def __init__(self, cmd, env, **_):
+            self.n = 0
+            jobs.append((cmd[cmd.index("tune") + 2], cmd[cmd.index("-t") + 1:cmd.index("--out")],
+                         env["HIP_VISIBLE_DEVICES"]))
+
+        def poll(self):  # a job runs for one round of the scheduler
+            self.n += 1
+            return 0 if self.n > 1 else None
+
+    monkeypatch.setattr(kt.subprocess, "Popen", Popen)
+    monkeypatch.setattr(kt, "lock_gpus", lambda gpus: [])
+    monkeypatch.setattr(kt.time, "sleep", lambda s: rounds.append(len(jobs)))
+    logs = []
+    assert kt.tune_all("m:T", t, t.select(["p"]), [0, 1, 2, 3, 4], 4, None,
+                       str(tmp_path / "out"), force=True, log=logs.append) == 0
+    # each problem: one job over all its points on as many free GPUs as its world; p-w4
+    # waits until the first two jobs free their GPUs
+    assert jobs == [("p-w2", ["1", "2", "3"], "0,1"), ("p-w3", ["1", "2", "3"], "2,3,4"),
+                    ("p-w4", ["1", "2", "3"], "0,1,2,3")]
+    assert rounds[0] == 2 and logs[0] == "p-w2: GPUs [0, 1], 3 points (one job of its ranks)"
+    with pytest.raises(SystemExit, match=r"\{'q': 9\} run on more GPUs"):
+        kt.tune_all("m:T", t, ["q"], [0, 1], 4, None, str(tmp_path / "out"), force=True)
+
+
+MULTI_TOY = '''
+from kernelkit import Registry, dim, multi_gpu
+
+ops = Registry()
+
+
+@ops.register
+def s_ref(x):
+    return x
+
+
+@ops.register
+@dim("n", (1, 2), id="n{}")
+def s_problem(n):
+    return dict(x=[0] * n)
+
+
+@ops.register
+def s_dims(x):
+    return dict(n=len(x))
+
+
+@ops.register
+@multi_gpu(2)
+def s_one(x):
+    return x
+'''
+
+
+def test_generated_tests_skip_multi_gpu(pytester):
+    pytester.makepyfile(toy=MULTI_TOY)
+    pytester.makepyfile(test_toy="from kernelkit.testing import op_tests\nfrom toy import ops\n"
+                                 "test_s = op_tests(ops.s, ops.s.problems('n'), table=None)\n")
+    res = pytester.runpytest("-q", "-rs", "-p", "no:cacheprovider")
+    res.assert_outcomes(skipped=4)  # dims + one config, two problems
+    res.stdout.fnmatch_lines(["*s runs on several GPUs (@multi_gpu): python -m kernelkit check*"])

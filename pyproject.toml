@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kernelkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Describe a GPU op as plain functions; get tests, a tuner, table dispatch and A/B tools"
 readme = "README.md"
 license = { file = "LICENSE" }
