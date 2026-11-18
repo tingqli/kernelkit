@@ -11,6 +11,8 @@
 
 solver 用什么写都行（FlyDSL、Triton、HIP、torch……）。
 
+[点击查看 tune csv 文件可视化页面](./kernelkit/plot.html)
+
 目录：
 
 1. [安装](#1-安装)
