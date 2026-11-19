@@ -11,7 +11,7 @@
 
 solver 用什么写都行（FlyDSL、Triton、HIP、torch……）。
 
-[点击查看 tune csv 文件可视化页面](./kernelkit/plot.html)
+[点击查看 tune csv 文件可视化页面](https://tingqli.github.io/kernelkit/kernelkit/plot.html)
 
 目录：
 
